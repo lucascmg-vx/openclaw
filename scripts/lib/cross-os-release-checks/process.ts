@@ -23,6 +23,7 @@ import type {
   CommandResult,
   GatewayHandle,
   LaneState,
+  StoppableProcessHandle,
 } from "./config.ts";
 import {
   CROSS_OS_COMMAND_CAPTURE_TAIL_BYTES,
@@ -154,7 +155,7 @@ export async function waitForGatewayWithStartupMigrationRestart(params: {
   }
 }
 
-export async function stopGateway(gateway: GatewayHandle | null) {
+export async function stopGateway(gateway: StoppableProcessHandle | null) {
   try {
     if (!gateway?.child?.pid) {
       return;
@@ -321,6 +322,8 @@ export async function runCommandInvocation(
     const child = spawn(invocation.command, invocation.args, {
       cwd: options.cwd,
       env: options.env,
+      uid: options.processIdentity?.uid,
+      gid: options.processIdentity?.gid,
       shell: invocation.shell,
       stdio: ["ignore", "pipe", "pipe"],
       detached: useProcessGroup,

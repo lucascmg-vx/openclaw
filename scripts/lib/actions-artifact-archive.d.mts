@@ -24,6 +24,7 @@ export type ArtifactBinding = {
   workflowPath: string;
   workflowSha: string;
   consumerRunAttempt?: number;
+  consumerRunId?: number;
   producerJobName?: string;
 };
 

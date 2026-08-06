@@ -18,6 +18,7 @@ import { dirname, join, resolve as resolvePath, win32 } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { pathToFileURL } from "node:url";
 import { describe, expect, it } from "vitest";
+import { parse } from "yaml";
 import {
   agentOutputHasExpectedOkMarker,
   acquireManagedGatewayInstallerHostLease,
@@ -44,6 +45,9 @@ import {
   dashboardHtmlMarkerStatus,
   type GatewayHandle,
   CROSS_OS_FETCH_BODY_MAX_CHARS,
+  GATEWAY_NODE_COMPAT_BASELINE_SPEC,
+  GATEWAY_NODE_COMPAT_BASELINE_TAG,
+  GATEWAY_NODE_COMPAT_BASELINE_VERSION,
   CROSS_OS_GATEWAY_READY_TIMEOUT_MS,
   CROSS_OS_GATEWAY_STATUS_COMMAND_TIMEOUT_MS,
   CROSS_OS_GATEWAY_STATUS_RPC_TIMEOUT_MS,
@@ -979,6 +983,189 @@ describe("scripts/openclaw-cross-os-release-checks", () => {
       "OPENCLAW_CROSS_OS_OPENAI_MODEL: ${{ inputs.openai_model || vars.OPENCLAW_CROSS_OS_OPENAI_MODEL || 'openai/gpt-5.6-luna' }}",
     );
     expect(releaseChecks).toContain("openai_model: openai/gpt-5.6-luna");
+  });
+
+  it("wires the required Linux x64 Gateway/node compatibility producer", () => {
+    const workflow = readFileSync(
+      ".github/workflows/openclaw-cross-os-release-checks-reusable.yml",
+      "utf8",
+    );
+    const producer = readFileSync(
+      "scripts/lib/cross-os-release-checks/gateway-node-compat.ts",
+      "utf8",
+    );
+    const releaseWorkflow = readFileSync(".github/workflows/openclaw-release-checks.yml", "utf8");
+    type WorkflowStep = {
+      env?: Record<string, string>;
+      id?: string;
+      if?: string;
+      name?: string;
+      run?: string;
+      uses?: string;
+      with?: Record<string, string>;
+    };
+    type WorkflowJob = {
+      needs?: string | string[];
+      outputs?: Record<string, string>;
+      "runs-on"?: string;
+      steps?: WorkflowStep[];
+      "timeout-minutes"?: number;
+      uses?: string;
+      with?: Record<string, string>;
+    };
+    const parsedWorkflow = parse(workflow) as { jobs: Record<string, WorkflowJob> };
+    const parsedReleaseWorkflow = parse(releaseWorkflow) as {
+      jobs: Record<string, WorkflowJob>;
+    };
+    const prepareJob = parsedWorkflow.jobs.prepare!;
+    const gatewayNodeJobDefinition = parsedWorkflow.jobs.gateway_node_linux_compat!;
+    const releaseCrossOsJob = parsedReleaseWorkflow.jobs.cross_os_release_checks!;
+
+    expect(GATEWAY_NODE_COMPAT_BASELINE_TAG).toBe("v2026.5.7");
+    expect(GATEWAY_NODE_COMPAT_BASELINE_VERSION).toBe("2026.5.7");
+    expect(GATEWAY_NODE_COMPAT_BASELINE_SPEC).toBe("openclaw@2026.5.7");
+    expect(workflow).toContain("gateway_node_linux_compat:");
+    expect(workflow).toContain("Gateway/node compatibility / Linux");
+    expect(workflow).toContain(
+      "openclaw-gateway-node-compat-baseline-${{ github.run_id }}-${{ github.run_attempt }}",
+    );
+    expect(workflow).toContain("--gateway-node-compat true");
+    expect(workflow).toContain("Run packaged Gateway/node compatibility in tokenless container");
+    expect(gatewayNodeJobDefinition).toMatchObject({
+      needs: "prepare",
+      "runs-on":
+        "${{ inputs.ubuntu_runner || vars.OPENCLAW_RELEASE_CHECKS_UBUNTU_RUNNER || 'blacksmith-8vcpu-ubuntu-2404' }}",
+      "timeout-minutes": 75,
+    });
+    const runnerArchitectureCheck = gatewayNodeJobDefinition.steps?.find(
+      (step) => step.name === "Require supported Linux runner",
+    );
+    expect(runnerArchitectureCheck?.env).toEqual({
+      RUNNER_ARCH: "${{ runner.arch }}",
+      RUNNER_OS: "${{ runner.os }}",
+    });
+    expect(runnerArchitectureCheck?.run).toContain("X64 | ARM64");
+    expect(prepareJob.outputs).toEqual(
+      expect.objectContaining({
+        candidate_artifact_digest:
+          "${{ inputs.candidate_artifact_digest || steps.upload_candidate.outputs.artifact-digest }}",
+        candidate_artifact_id:
+          "${{ inputs.candidate_artifact_id || steps.upload_candidate.outputs.artifact-id }}",
+        candidate_artifact_name:
+          "${{ inputs.candidate_artifact_name || format('openclaw-cross-os-release-checks-candidate-{0}-{1}', github.run_id, github.run_attempt) }}",
+        candidate_artifact_run_attempt:
+          "${{ inputs.candidate_artifact_run_attempt || github.run_attempt }}",
+        candidate_artifact_run_id: "${{ inputs.candidate_artifact_run_id || github.run_id }}",
+        candidate_file_name: "${{ steps.candidate_metadata.outputs.file_name }}",
+        candidate_sha256: "${{ steps.candidate_metadata.outputs.sha256 }}",
+        candidate_version: "${{ steps.candidate_metadata.outputs.version }}",
+        source_sha: "${{ steps.candidate_metadata.outputs.source_sha }}",
+      }),
+    );
+    expect(prepareJob.steps?.find((step) => step.id === "upload_candidate")).toMatchObject({
+      if: "inputs.candidate_artifact_name == ''",
+      with: {
+        name: "openclaw-cross-os-release-checks-candidate-${{ github.run_id }}-${{ github.run_attempt }}",
+      },
+    });
+    expect(
+      gatewayNodeJobDefinition.steps?.find((step) => step.name === "Download candidate artifact")
+        ?.with,
+    ).toEqual(
+      expect.objectContaining({
+        "artifact-ids": "${{ needs.prepare.outputs.candidate_artifact_id }}",
+        "run-id": "${{ needs.prepare.outputs.candidate_artifact_run_id }}",
+      }),
+    );
+    const runGatewayNodeCompat = gatewayNodeJobDefinition.steps?.find(
+      (step) => step.name === "Run packaged Gateway/node compatibility in tokenless container",
+    );
+    expect(runGatewayNodeCompat?.env).toEqual(
+      expect.objectContaining({
+        CANDIDATE_ARTIFACT_DIGEST: "${{ needs.prepare.outputs.candidate_artifact_digest }}",
+        CANDIDATE_ARTIFACT_ID: "${{ needs.prepare.outputs.candidate_artifact_id }}",
+        CANDIDATE_ARTIFACT_NAME: "${{ needs.prepare.outputs.candidate_artifact_name }}",
+        CANDIDATE_ARTIFACT_RUN_ATTEMPT:
+          "${{ needs.prepare.outputs.candidate_artifact_run_attempt }}",
+        CANDIDATE_ARTIFACT_RUN_ID: "${{ needs.prepare.outputs.candidate_artifact_run_id }}",
+        CANDIDATE_SHA256: "${{ needs.prepare.outputs.candidate_sha256 }}",
+        CANDIDATE_SOURCE_SHA: "${{ needs.prepare.outputs.source_sha }}",
+        CANDIDATE_VERSION: "${{ needs.prepare.outputs.candidate_version }}",
+      }),
+    );
+    expect(runGatewayNodeCompat?.run).toContain(
+      '--candidate-artifact-name "${CANDIDATE_ARTIFACT_NAME}"',
+    );
+    expect(runGatewayNodeCompat?.run).toContain(
+      '--candidate-artifact-run-id "${CANDIDATE_ARTIFACT_RUN_ID}"',
+    );
+    expect(runGatewayNodeCompat?.run).not.toContain("${{ needs.prepare.outputs");
+    expect(workflow).toContain("Resolve provided candidate package");
+    expect(workflow).toContain("--source artifact");
+    expect(workflow).toContain('"$actual_source_sha" == "$INPUT_CANDIDATE_SOURCE_SHA"');
+    expect(workflow).toContain('"$actual_version" == "$INPUT_CANDIDATE_VERSION"');
+    expect(releaseCrossOsJob.with).toEqual(
+      expect.objectContaining({
+        candidate_artifact_digest: "${{ needs.prepare_release_package.outputs.artifact_digest }}",
+        candidate_artifact_id: "${{ needs.prepare_release_package.outputs.artifact_id }}",
+        candidate_artifact_name: "${{ needs.prepare_release_package.outputs.artifact_name }}",
+        candidate_artifact_run_attempt:
+          "${{ needs.prepare_release_package.outputs.artifact_run_attempt }}",
+        candidate_artifact_run_id: "${{ needs.prepare_release_package.outputs.artifact_run_id }}",
+        candidate_file_name: "${{ needs.prepare_release_package.outputs.package_file_name }}",
+        candidate_sha256: "${{ needs.prepare_release_package.outputs.package_sha256 }}",
+        candidate_source_sha: "${{ needs.prepare_release_package.outputs.source_sha }}",
+        candidate_version: "${{ needs.prepare_release_package.outputs.package_version }}",
+      }),
+    );
+    const gatewayNodeJob = workflow.slice(workflow.indexOf("  gateway_node_linux_compat:"));
+    const setupObserverDependencies = gatewayNodeJob.indexOf(
+      "- name: Setup trusted Gateway/node observer dependencies",
+    );
+    const installObserverDependencies = gatewayNodeJob.indexOf(
+      "- name: Install trusted Gateway/node observer dependencies",
+    );
+    const runCompatibility = gatewayNodeJob.indexOf(
+      "- name: Run packaged Gateway/node compatibility in tokenless container",
+    );
+    expect(setupObserverDependencies).toBeGreaterThan(0);
+    expect(installObserverDependencies).toBeGreaterThan(setupObserverDependencies);
+    expect(runCompatibility).toBeGreaterThan(installObserverDependencies);
+    expect(gatewayNodeJob).toContain(
+      "run: pnpm install --filter . --frozen-lockfile --prefer-offline --ignore-scripts",
+    );
+    expect(gatewayNodeJob).not.toContain("--ignore-scripts=false");
+    expect(producer).toContain(
+      "node:24-bookworm-slim@sha256:6f7b03f7c2c8e2e784dcf9295400527b9b1270fd37b7e9a7285cf83b6951452d",
+    );
+    expect(producer).toContain('"--read-only"');
+    expect(producer).toContain('"--cap-drop"');
+    expect(producer).toContain('"no-new-privileges"');
+    expect(producer).toContain('"--pids-limit"');
+    expect(producer).toContain('"--network", "none"');
+    expect(producer).toContain('join(workflowRoot, "scripts")');
+    expect(producer).toContain('join(workflowRoot, "packages", "normalization-core")');
+    expect(producer).not.toContain('buildDockerBindMount(params.workflowRoot, "/workflow", true)');
+    expect(producer).not.toContain("/var/run/docker.sock");
+    expect(producer).not.toContain('"--privileged"');
+    expect(producer).not.toContain('"--env-file"');
+    expect(workflow).not.toContain("Validate prepared compatibility artifact bindings");
+    expect(workflow).not.toContain("Verify compatibility package hashes");
+    expect(workflow).not.toContain("--workflow-sha");
+    expect(workflow).not.toContain("--candidate-artifact-size");
+    expect(workflow).not.toContain("--compat-baseline-artifact-size");
+    expect(workflow).not.toContain("--job gateway_node_linux_compat");
+    expect(workflow).toContain("Upload Gateway/node compatibility failure diagnostics");
+    expect(workflow).toContain("gateway_node_compat_artifact_size:");
+    expect(workflow).toContain(
+      "artifact_size: ${{ steps.capture_gateway_node_compat_artifact.outputs.size }}",
+    );
+    expect(workflow).toContain(
+      "openclaw-gateway-node-linux-compat-${{ github.run_id }}-${{ github.run_attempt }}",
+    );
+    expect(workflow).toContain(
+      "gateway_node_linux_compat:\n    name: Gateway/node compatibility / Linux\n    needs: prepare\n    continue-on-error: ${{ inputs.advisory }}",
+    );
   });
 
   it("keeps release smoke plugin allowlists focused on agent-turn essentials", () => {

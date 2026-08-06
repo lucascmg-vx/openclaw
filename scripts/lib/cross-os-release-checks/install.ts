@@ -13,7 +13,13 @@ import {
 import { dirname, join, relative, resolve, win32 as pathWin32 } from "node:path";
 import { pathToFileURL } from "node:url";
 import { isLocalBuildMetadataDistPath } from "../local-build-metadata-paths.mjs";
-import type { CandidateBuild, LaneCommandParams, LaneState, PackageJson } from "./config.ts";
+import type {
+  CandidateBuild,
+  LaneCommandParams,
+  LaneState,
+  PackageJson,
+  ProcessIdentity,
+} from "./config.ts";
 import {
   CROSS_OS_NPM_DEBUG_LOG_TAIL_BYTES,
   INSTALL_STAGE_DEBRIS_DIR_PATTERN,
@@ -389,6 +395,7 @@ export async function installTarballPackage(params: {
   timeoutMs?: number;
   ignoreScripts?: boolean;
   restoreBundledPluginPostinstall?: boolean;
+  processIdentity?: ProcessIdentity;
 }) {
   await installPackageSpec({
     lane: params.lane,
@@ -397,6 +404,7 @@ export async function installTarballPackage(params: {
     logPath: params.logPath,
     timeoutMs: params.timeoutMs,
     ignoreScripts: params.ignoreScripts,
+    processIdentity: params.processIdentity,
   });
   if (
     params.restoreBundledPluginPostinstall !== false &&
@@ -417,6 +425,7 @@ export async function installPackageSpec(params: {
   logPath: string;
   timeoutMs?: number;
   ignoreScripts?: boolean;
+  processIdentity?: ProcessIdentity;
 }) {
   const installEnv = {
     ...params.env,
@@ -434,6 +443,7 @@ export async function installPackageSpec(params: {
         env: installEnv,
         logPath: params.logPath,
         timeoutMs: params.timeoutMs ?? installTimeoutMs(),
+        processIdentity: params.processIdentity,
       },
     );
   } catch (error) {

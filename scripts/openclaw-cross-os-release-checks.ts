@@ -13,6 +13,10 @@ import {
   resolveProviderConfig,
   resolveRunnerMatrix,
 } from "./lib/cross-os-release-checks/config.ts";
+import {
+  parseGatewayNodeCompatRunParams,
+  runGatewayNodeLinuxCompat,
+} from "./lib/cross-os-release-checks/gateway-node-compat.ts";
 import { prepareCandidate, readProvidedCandidate } from "./lib/cross-os-release-checks/install.ts";
 import {
   runDevUpdateSuite,
@@ -49,6 +53,11 @@ function isMainModule() {
 
 async function main(argv: string[]) {
   const args = parseArgs(argv);
+
+  if (args["gateway-node-compat"] === "true") {
+    await runGatewayNodeLinuxCompat(parseGatewayNodeCompatRunParams(args));
+    return;
+  }
 
   if (args["resolve-matrix"] === "true") {
     const mode = args["mode"] ?? "both";

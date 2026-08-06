@@ -39,15 +39,21 @@ export type LaneState = {
   gatewayPort: number;
   phaseTimings: Array<{ name: string; status: "pass" | "fail"; durationMs: number }>;
 };
-export type GatewayHandle = {
+export type StoppableProcessHandle = {
   child: ChildProcess;
   closeLog: () => Promise<void>;
-  launchLogOffset: number;
   logPath: string;
+};
+export type GatewayHandle = StoppableProcessHandle & {
+  launchLogOffset: number;
   waitForClose: () => Promise<void>;
 };
 export type CommandResult = { exitCode: number; stdout: string; stderr: string };
 export type AgentTurnResult = CommandResult | { status: number; stdout: string; stderr: string };
+export type ProcessIdentity = {
+  uid: number;
+  gid: number;
+};
 export type CommandOptions = {
   cwd?: string;
   env?: NodeJS.ProcessEnv;
@@ -55,6 +61,7 @@ export type CommandOptions = {
   timeoutMs?: number;
   check?: boolean;
   maxOutputBytes?: number;
+  processIdentity?: ProcessIdentity;
 };
 export type CommandInvocation = {
   command: string;
@@ -99,6 +106,9 @@ export type SummaryPayload = {
 };
 
 export const PUBLISHED_INSTALLER_BASE_URL = "https://openclaw.ai";
+export const GATEWAY_NODE_COMPAT_BASELINE_TAG = "v2026.5.7";
+export const GATEWAY_NODE_COMPAT_BASELINE_VERSION = "2026.5.7";
+export const GATEWAY_NODE_COMPAT_BASELINE_SPEC = `openclaw@${GATEWAY_NODE_COMPAT_BASELINE_VERSION}`;
 
 const SUPPORTED_MODES = new Set<CrossOsMode>(["fresh", "upgrade", "both"]);
 const SUPPORTED_SUITES = new Set<CrossOsSuite>([

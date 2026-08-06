@@ -210,6 +210,25 @@ on:
         required: false
         default: ""
         type: string
+    outputs:
+      gateway_node_compat_artifact_id:
+        description: Immutable Linux Gateway/node compatibility evidence artifact id
+        value: ${{ jobs.gateway_node_linux_compat.outputs.artifact_id }}
+      gateway_node_compat_artifact_digest:
+        description: Linux Gateway/node compatibility evidence artifact digest
+        value: ${{ jobs.gateway_node_linux_compat.outputs.artifact_digest }}
+      gateway_node_compat_artifact_name:
+        description: Linux Gateway/node compatibility evidence artifact name
+        value: ${{ jobs.gateway_node_linux_compat.outputs.artifact_name }}
+      gateway_node_compat_artifact_run_attempt:
+        description: Linux Gateway/node compatibility evidence producer run attempt
+        value: ${{ jobs.gateway_node_linux_compat.outputs.artifact_run_attempt }}
+      gateway_node_compat_artifact_run_id:
+        description: Linux Gateway/node compatibility evidence producer run id
+        value: ${{ jobs.gateway_node_linux_compat.outputs.artifact_run_id }}
+      gateway_node_compat_artifact_size:
+        description: Linux Gateway/node compatibility evidence artifact size in bytes
+        value: ${{ jobs.gateway_node_linux_compat.outputs.artifact_size }}
     secrets:
       OPENAI_API_KEY:
         required: false
@@ -248,10 +267,19 @@ jobs:
       baseline_file_name: ${{ steps.baseline_metadata.outputs.file_name }}
       baseline_sha256: ${{ steps.baseline_metadata.outputs.sha256 }}
       baseline_spec: ${{ steps.baseline.outputs.value }}
-      candidate_artifact_digest: ${{ steps.upload_candidate.outputs.artifact-digest }}
-      candidate_artifact_id: ${{ steps.upload_candidate.outputs.artifact-id }}
-      candidate_artifact_run_attempt: ${{ github.run_attempt }}
-      candidate_artifact_run_id: ${{ github.run_id }}
+      compat_baseline_artifact_digest: ${{ steps.upload_compat_baseline.outputs.artifact-digest }}
+      compat_baseline_artifact_id: ${{ steps.upload_compat_baseline.outputs.artifact-id }}
+      compat_baseline_artifact_run_attempt: ${{ github.run_attempt }}
+      compat_baseline_artifact_run_id: ${{ github.run_id }}
+      compat_baseline_file_name: ${{ steps.compat_baseline.outputs.file_name }}
+      compat_baseline_sha256: ${{ steps.compat_baseline.outputs.sha256 }}
+      compat_baseline_source_sha: ${{ steps.compat_baseline.outputs.source_sha }}
+      compat_baseline_version: ${{ steps.compat_baseline.outputs.version }}
+      candidate_artifact_digest: ${{ inputs.candidate_artifact_digest || steps.upload_candidate.outputs.artifact-digest }}
+      candidate_artifact_id: ${{ inputs.candidate_artifact_id || steps.upload_candidate.outputs.artifact-id }}
+      candidate_artifact_name: ${{ inputs.candidate_artifact_name || format('openclaw-cross-os-release-checks-candidate-{0}-{1}', github.run_id, github.run_attempt) }}
+      candidate_artifact_run_attempt: ${{ inputs.candidate_artifact_run_attempt || github.run_attempt }}
+      candidate_artifact_run_id: ${{ inputs.candidate_artifact_run_id || github.run_id }}
       candidate_file_name: ${{ steps.candidate_metadata.outputs.file_name }}
       candidate_sha256: ${{ steps.candidate_metadata.outputs.sha256 }}
       candidate_version: ${{ steps.candidate_metadata.outputs.version }}
@@ -592,6 +620,47 @@ jobs:
           mkdir -p "${OUTPUT_DIR}"
           timeout --preserve-status 300s npm pack --ignore-scripts --json "${BASELINE_SPEC}" --pack-destination "${OUTPUT_DIR}" > "${OUTPUT_DIR}/pack.json"
 
+      - name: Resolve Gateway/node v3 compatibility baseline
+        id: compat_baseline
+        env:
+          BASELINE_TAG: v2026.5.7
+          BASELINE_VERSION: 2026.5.7
+          OUTPUT_DIR: ${{ runner.temp }}/openclaw-cross-os-release-checks/prepare/compat-baseline
+        run: |
+          set -euo pipefail
+          remote_url="https://github.com/${OPENCLAW_REPOSITORY}.git"
+          source_sha="$(
+            git ls-remote "${remote_url}" "refs/tags/${BASELINE_TAG}^{}" | awk 'NR == 1 { print $1 }'
+          )"
+          if [[ -z "${source_sha}" ]]; then
+            source_sha="$(
+              git ls-remote "${remote_url}" "refs/tags/${BASELINE_TAG}" | awk 'NR == 1 { print $1 }'
+            )"
+          fi
+          [[ "${source_sha}" =~ ^[a-f0-9]{40}$ ]] || {
+            echo "Failed to resolve ${BASELINE_TAG} to one full source SHA." >&2
+            exit 1
+          }
+          mkdir -p "${OUTPUT_DIR}"
+          timeout --preserve-status 300s npm pack --ignore-scripts --json "openclaw@${BASELINE_VERSION}" --pack-destination "${OUTPUT_DIR}" > "${OUTPUT_DIR}/pack.json"
+          echo "source_sha=${source_sha}" >> "$GITHUB_OUTPUT"
+          echo "version=${BASELINE_VERSION}" >> "$GITHUB_OUTPUT"
+          node --input-type=module <<'NODE' >>"$GITHUB_OUTPUT"
+          import crypto from "node:crypto";
+          import fs from "node:fs";
+          import path from "node:path";
+          import { resolveNpmJsonEntries } from "./workflow/scripts/lib/npm-json-output.mjs";
+          const packJson = path.join(process.env.OUTPUT_DIR, "pack.json");
+          const payload = JSON.parse(fs.readFileSync(packJson, "utf8"));
+          const fileName = resolveNpmJsonEntries(payload).at(-1)?.filename?.trim() ?? "";
+          if (!fileName.endsWith(".tgz") || fileName !== path.basename(fileName) || fileName !== path.win32.basename(fileName)) {
+            throw new Error("Gateway/node compatibility baseline must be a local .tgz filename.");
+          }
+          const bytes = fs.readFileSync(path.join(process.env.OUTPUT_DIR, fileName));
+          process.stdout.write(`file_name=${fileName}\n`);
+          process.stdout.write(`sha256=${crypto.createHash("sha256").update(bytes).digest("hex")}\n`);
+          NODE
+
       - name: Capture candidate metadata
         id: candidate_metadata
         env:
@@ -672,6 +741,7 @@ jobs:
 
       - name: Upload candidate artifact
         id: upload_candidate
+        if: inputs.candidate_artifact_name == ''
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: openclaw-cross-os-release-checks-candidate-${{ github.run_id }}-${{ github.run_attempt }}
@@ -685,6 +755,14 @@ jobs:
         with:
           name: openclaw-cross-os-release-checks-baseline-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/openclaw-cross-os-release-checks/prepare/baseline/${{ steps.baseline_metadata.outputs.file_name }}
+          if-no-files-found: error
+
+      - name: Upload Gateway/node v3 compatibility baseline
+        id: upload_compat_baseline
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: openclaw-gateway-node-compat-baseline-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/openclaw-cross-os-release-checks/prepare/compat-baseline/${{ steps.compat_baseline.outputs.file_name }}
           if-no-files-found: error
 
       - name: Resolve runner matrix
@@ -746,7 +824,7 @@ jobs:
         env:
           ARTIFACT_DIGEST: ${{ needs.prepare.outputs.candidate_artifact_digest }}
           ARTIFACT_ID: ${{ needs.prepare.outputs.candidate_artifact_id }}
-          ARTIFACT_NAME: ${{ format('openclaw-cross-os-release-checks-candidate-{0}-{1}', needs.prepare.outputs.candidate_artifact_run_id, needs.prepare.outputs.candidate_artifact_run_attempt) }}
+          ARTIFACT_NAME: ${{ needs.prepare.outputs.candidate_artifact_name }}
           ARTIFACT_RUN_ATTEMPT: ${{ needs.prepare.outputs.candidate_artifact_run_attempt }}
           ARTIFACT_RUN_ID: ${{ needs.prepare.outputs.candidate_artifact_run_id }}
           BASELINE_ARTIFACT_DIGEST: ${{ needs.prepare.outputs.baseline_artifact_digest }}
@@ -1028,3 +1106,149 @@ jobs:
           name: openclaw-cross-os-release-checks-${{ matrix.artifact_name }}-${{ matrix.suite }}-${{ github.run_id }}
           path: ${{ runner.temp }}/openclaw-cross-os-release-checks/${{ matrix.artifact_name }}-${{ matrix.suite }}
           if-no-files-found: error
+
+  gateway_node_linux_compat:
+    name: Gateway/node compatibility / Linux
+    needs: prepare
+    continue-on-error: ${{ inputs.advisory }}
+    runs-on: ${{ inputs.ubuntu_runner || vars.OPENCLAW_RELEASE_CHECKS_UBUNTU_RUNNER || 'blacksmith-8vcpu-ubuntu-2404' }}
+    timeout-minutes: 75
+    outputs:
+      artifact_digest: ${{ steps.upload_gateway_node_compat.outputs.artifact-digest }}
+      artifact_id: ${{ steps.upload_gateway_node_compat.outputs.artifact-id }}
+      artifact_name: openclaw-gateway-node-linux-compat-${{ github.run_id }}-${{ github.run_attempt }}
+      artifact_run_attempt: ${{ github.run_attempt }}
+      artifact_run_id: ${{ github.run_id }}
+      artifact_size: ${{ steps.capture_gateway_node_compat_artifact.outputs.size }}
+    steps:
+      - name: Checkout workflow repo
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          repository: ${{ env.OPENCLAW_REPOSITORY }}
+          ref: ${{ needs.prepare.outputs.workflow_ref }}
+          path: workflow
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Setup trusted Gateway/node observer dependencies
+        uses: ./workflow/.github/actions/setup-pnpm-store-cache
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          package-manager-file: workflow/package.json
+          lockfile-path: workflow/pnpm-lock.yaml
+          use-actions-cache: "false"
+
+      - name: Install trusted Gateway/node observer dependencies
+        working-directory: workflow
+        env:
+          CI: "true"
+        run: pnpm install --filter . --frozen-lockfile --prefer-offline --ignore-scripts
+
+      - name: Require supported Linux runner
+        env:
+          RUNNER_ARCH: ${{ runner.arch }}
+          RUNNER_OS: ${{ runner.os }}
+        run: |
+          set -euo pipefail
+          test "${RUNNER_OS}" = "Linux"
+          case "${RUNNER_ARCH}" in
+            X64 | ARM64) ;;
+            *)
+              echo "Unsupported Gateway/node compatibility runner architecture: ${RUNNER_ARCH}" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Download candidate artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          artifact-ids: ${{ needs.prepare.outputs.candidate_artifact_id }}
+          path: ${{ runner.temp }}/openclaw-gateway-node-compat/candidate
+          run-id: ${{ needs.prepare.outputs.candidate_artifact_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Download v3 compatibility baseline artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          artifact-ids: ${{ needs.prepare.outputs.compat_baseline_artifact_id }}
+          path: ${{ runner.temp }}/openclaw-gateway-node-compat/baseline
+          run-id: ${{ needs.prepare.outputs.compat_baseline_artifact_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Run packaged Gateway/node compatibility in tokenless container
+        env:
+          BASELINE_TGZ: ${{ runner.temp }}/openclaw-gateway-node-compat/baseline/${{ needs.prepare.outputs.compat_baseline_file_name }}
+          BASELINE_ARTIFACT_DIGEST: ${{ needs.prepare.outputs.compat_baseline_artifact_digest }}
+          BASELINE_ARTIFACT_ID: ${{ needs.prepare.outputs.compat_baseline_artifact_id }}
+          BASELINE_ARTIFACT_RUN_ATTEMPT: ${{ needs.prepare.outputs.compat_baseline_artifact_run_attempt }}
+          BASELINE_ARTIFACT_RUN_ID: ${{ needs.prepare.outputs.compat_baseline_artifact_run_id }}
+          BASELINE_SHA256: ${{ needs.prepare.outputs.compat_baseline_sha256 }}
+          BASELINE_SOURCE_SHA: ${{ needs.prepare.outputs.compat_baseline_source_sha }}
+          BASELINE_VERSION: ${{ needs.prepare.outputs.compat_baseline_version }}
+          CANDIDATE_ARTIFACT_DIGEST: ${{ needs.prepare.outputs.candidate_artifact_digest }}
+          CANDIDATE_ARTIFACT_ID: ${{ needs.prepare.outputs.candidate_artifact_id }}
+          CANDIDATE_ARTIFACT_NAME: ${{ needs.prepare.outputs.candidate_artifact_name }}
+          CANDIDATE_ARTIFACT_RUN_ATTEMPT: ${{ needs.prepare.outputs.candidate_artifact_run_attempt }}
+          CANDIDATE_ARTIFACT_RUN_ID: ${{ needs.prepare.outputs.candidate_artifact_run_id }}
+          CANDIDATE_SHA256: ${{ needs.prepare.outputs.candidate_sha256 }}
+          CANDIDATE_SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+          CANDIDATE_TGZ: ${{ runner.temp }}/openclaw-gateway-node-compat/candidate/${{ needs.prepare.outputs.candidate_file_name }}
+          CANDIDATE_VERSION: ${{ needs.prepare.outputs.candidate_version }}
+          GATEWAY_NODE_COMPAT_WORKFLOW_SHA: ${{ needs.prepare.outputs.workflow_ref }}
+          GITHUB_TOKEN: ${{ github.token }}
+          OUTPUT_DIR: ${{ runner.temp }}/openclaw-gateway-node-compat/evidence
+        run: |
+          set -euo pipefail
+          bash workflow/scripts/github/run-openclaw-cross-os-release-checks.sh \
+            --gateway-node-compat true \
+            --output-dir "${OUTPUT_DIR}" \
+            --candidate-tgz "${CANDIDATE_TGZ}" \
+            --candidate-version "${CANDIDATE_VERSION}" \
+            --candidate-source-sha "${CANDIDATE_SOURCE_SHA}" \
+            --candidate-sha256 "${CANDIDATE_SHA256}" \
+            --candidate-artifact-id "${CANDIDATE_ARTIFACT_ID}" \
+            --candidate-artifact-name "${CANDIDATE_ARTIFACT_NAME}" \
+            --candidate-artifact-digest "${CANDIDATE_ARTIFACT_DIGEST}" \
+            --candidate-artifact-run-id "${CANDIDATE_ARTIFACT_RUN_ID}" \
+            --candidate-artifact-run-attempt "${CANDIDATE_ARTIFACT_RUN_ATTEMPT}" \
+            --compat-baseline-tgz "${BASELINE_TGZ}" \
+            --compat-baseline-version "${BASELINE_VERSION}" \
+            --compat-baseline-source-sha "${BASELINE_SOURCE_SHA}" \
+            --compat-baseline-sha256 "${BASELINE_SHA256}" \
+            --compat-baseline-artifact-id "${BASELINE_ARTIFACT_ID}" \
+            --compat-baseline-artifact-digest "${BASELINE_ARTIFACT_DIGEST}" \
+            --compat-baseline-artifact-run-id "${BASELINE_ARTIFACT_RUN_ID}" \
+            --compat-baseline-artifact-run-attempt "${BASELINE_ARTIFACT_RUN_ATTEMPT}"
+
+      - name: Upload Gateway/node compatibility failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: openclaw-gateway-node-linux-compat-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/openclaw-gateway-node-compat/diagnostics
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Upload Gateway/node compatibility evidence
+        id: upload_gateway_node_compat
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: openclaw-gateway-node-linux-compat-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/openclaw-gateway-node-compat/evidence
+          if-no-files-found: error
+
+      - name: Capture Gateway/node compatibility evidence artifact binding
+        id: capture_gateway_node_compat_artifact
+        env:
+          ARTIFACT_ID: ${{ steps.upload_gateway_node_compat.outputs.artifact-id }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          size="$(gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT_ID}" --jq '.size_in_bytes | select(type == "number" and . > 0)')"
+          [[ "${size}" =~ ^[1-9][0-9]*$ ]] || { echo "Evidence artifact size is invalid." >&2; exit 1; }
+          echo "size=${size}" >> "$GITHUB_OUTPUT"

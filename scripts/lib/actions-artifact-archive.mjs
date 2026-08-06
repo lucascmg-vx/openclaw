@@ -674,11 +674,19 @@ function requireExpectedBinding(params) {
     runStatePolicy === "same-run-producer-success"
       ? assertPositiveInteger(expected.consumerRunAttempt, "consumer workflow run attempt")
       : undefined;
+  const consumerRunId =
+    runStatePolicy === "same-run-producer-success"
+      ? assertPositiveInteger(expected.consumerRunId ?? runId, "consumer workflow run ID")
+      : undefined;
   const producerJobName =
     runStatePolicy === "same-run-producer-success"
       ? assertTrimmedString(expected.producerJobName, "producer job name")
       : undefined;
-  if (consumerRunAttempt !== undefined && runAttempt > consumerRunAttempt) {
+  if (
+    consumerRunAttempt !== undefined &&
+    consumerRunId === runId &&
+    runAttempt > consumerRunAttempt
+  ) {
     throw new Error("Producer workflow run attempt must not be newer than the consumer attempt.");
   }
   return {
@@ -687,6 +695,7 @@ function requireExpectedBinding(params) {
     artifactName,
     artifactSizeBytes,
     consumerRunAttempt,
+    consumerRunId,
     producerJobName,
     repository,
     runStatePolicy,
@@ -736,7 +745,10 @@ export function validateActionsArtifactBinding(params) {
     if (run.status !== "completed" || run.conclusion !== "success") {
       throw new Error("Actions workflow run does not match the immutable publication tuple.");
     }
-  } else if (expected.runAttempt === expected.consumerRunAttempt) {
+  } else if (
+    expected.runId === expected.consumerRunId &&
+    expected.runAttempt === expected.consumerRunAttempt
+  ) {
     // Environment protection reports the active workflow as waiting until the
     // approval transition propagates, even while the approved consumer runs.
     if (!ACTIVE_SAME_RUN_STATUSES.has(run.status) || run.conclusion !== null) {
