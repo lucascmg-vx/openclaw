@@ -2,7 +2,6 @@
 import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { createServer } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -14,10 +13,7 @@ import {
   parseKnipCompactUnusedFiles,
   runKnipUnusedFiles,
 } from "../../scripts/check-deadcode-unused-files.mjs";
-import {
-  runManagedCommand,
-  terminateManagedChild,
-} from "../../scripts/lib/managed-child-process.mjs";
+import { runManagedCommand } from "../../scripts/lib/managed-child-process.mjs";
 import {
   isProcessAlive,
   waitForChildClose,
@@ -38,8 +34,6 @@ class FakeKnipProcess extends EventEmitter {
 
 // Windows cleanup can spend 10s each on graceful and forced taskkill attempts.
 const KNIP_CLI_FIXTURE_TIMEOUT_MS = 30_000;
-const KNIP_TIMEOUT_ARMED_MESSAGE = "openclaw-test-knip-timeout-armed";
-const KNIP_TIMEOUT_TRIGGER_MESSAGE = "openclaw-test-knip-timeout-trigger";
 
 function finishFakeProcess(
   child: FakeKnipProcess,
@@ -71,34 +65,51 @@ function readRecordedPidForCleanup(pidPath: string): number | undefined {
   }
 }
 
-// The fixture owns timeout readiness: arm the real runner timer first, then let the
-// test trigger it only after every process PID is valid.
+// Accelerate the real runner timeout only after every fixture-owned process is live.
 function createControlledKnipTimeoutPreload(): string {
   return `
+import { readFileSync } from "node:fs";
 const realSetTimeout = globalThis.setTimeout.bind(globalThis);
 const realClearTimeout = globalThis.clearTimeout.bind(globalThis);
+const realSetInterval = globalThis.setInterval.bind(globalThis);
+const realClearInterval = globalThis.clearInterval.bind(globalThis);
 const timeoutHandle = {};
 let timeoutCallback;
-const disconnect = () => {
-  process.off("message", onMessage);
-  if (process.connected) {
-    process.disconnect();
+let timeoutPidPaths;
+let readinessInterval;
+const stopReadinessPoll = () => {
+  if (readinessInterval) {
+    realClearInterval(readinessInterval);
+    readinessInterval = undefined;
   }
 };
-const onMessage = (message) => {
-  if (message?.kind !== ${JSON.stringify(KNIP_TIMEOUT_TRIGGER_MESSAGE)}) {
+const isRecordedProcessLive = (pidPath) => {
+  try {
+    const pid = Number(readFileSync(pidPath, "utf8"));
+    if (!Number.isSafeInteger(pid) || pid <= 0) {
+      return false;
+    }
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM";
+  }
+};
+const triggerWhenReady = () => {
+  if (!timeoutCallback || !timeoutPidPaths?.every(isRecordedProcessLive)) {
     return;
   }
   const callback = timeoutCallback;
   timeoutCallback = undefined;
-  disconnect();
-  callback?.();
+  timeoutPidPaths = undefined;
+  stopReadinessPoll();
+  callback();
 };
-process.on("message", onMessage);
 globalThis.clearTimeout = (timer) => {
   if (timer === timeoutHandle) {
     timeoutCallback = undefined;
-    disconnect();
+    timeoutPidPaths = undefined;
+    stopReadinessPoll();
     return;
   }
   return realClearTimeout(timer);
@@ -110,29 +121,24 @@ globalThis.setTimeout = (callback, delay, ...args) => {
   if (timeoutCallback) {
     throw new Error("Knip timeout was armed more than once");
   }
-  if (!process.send) {
-    throw new Error("Knip timeout fixture requires an IPC channel");
+  const encodedPidPaths = process.env.OPENCLAW_TEST_KNIP_TIMEOUT_PID_PATHS;
+  try {
+    timeoutPidPaths = JSON.parse(encodedPidPaths ?? "");
+  } catch {
+    throw new Error("Knip timeout fixture requires encoded PID paths");
+  }
+  if (
+    !Array.isArray(timeoutPidPaths) ||
+    timeoutPidPaths.length === 0 ||
+    !timeoutPidPaths.every((pidPath) => typeof pidPath === "string" && pidPath.length > 0)
+  ) {
+    throw new Error("Knip timeout fixture requires valid PID paths");
   }
   timeoutCallback = () => callback(...args);
-  process.send({ kind: ${JSON.stringify(KNIP_TIMEOUT_ARMED_MESSAGE)} });
+  readinessInterval = realSetInterval(triggerWhenReady, 5);
+  triggerWhenReady();
   return timeoutHandle;
 };
-`;
-}
-
-function createKnipReadySignalSource(pidExpressions: string[]): string {
-  return `
-const readySocket = require("node:net").connect(
-  {
-    host: "127.0.0.1",
-    port: Number(process.env.OPENCLAW_TEST_KNIP_READY_PORT),
-  },
-  () => readySocket.end(JSON.stringify({ pids: [${pidExpressions.join(", ")}] })),
-);
-readySocket.once("error", (error) => {
-  process.stderr.write(\`Knip readiness signal failed: \${error.message}\\n\`);
-  process.exit(2);
-});
 `;
 }
 
@@ -152,53 +158,10 @@ async function runKnipCliFixture({
   const pnpmExecPath = path.join(root, "pnpm.cjs");
   const preloadPath = path.join(root, "preload.mjs");
   let stderr = "";
-  let timeoutArmed = false;
-  let triggerError: unknown;
-  let triggerPromise = Promise.resolve();
-  let readyPort: number | undefined;
-  let readyPidsPromise: Promise<number[]> | undefined;
-  const readyServer = createServer();
 
   try {
-    if (timeoutPidPaths.length > 0) {
-      readyPidsPromise = new Promise<number[]>((resolve, reject) => {
-        readyServer.once("connection", (socket) => {
-          let payload = "";
-          socket.setEncoding("utf8");
-          socket.on("data", (chunk) => {
-            payload += String(chunk);
-          });
-          socket.once("error", reject);
-          socket.once("end", () => {
-            try {
-              const parsed = JSON.parse(payload) as { pids?: unknown };
-              if (
-                !Array.isArray(parsed.pids) ||
-                parsed.pids.length !== timeoutPidPaths.length ||
-                !parsed.pids.every((pid) => Number.isSafeInteger(pid) && Number(pid) > 0)
-              ) {
-                throw new Error("Knip readiness signal contained invalid PIDs");
-              }
-              resolve(parsed.pids as number[]);
-            } catch (error) {
-              reject(
-                error instanceof Error
-                  ? error
-                  : new Error("Knip readiness signal parsing failed", { cause: error }),
-              );
-            }
-          });
-        });
-      });
-      await new Promise<void>((resolve, reject) => {
-        readyServer.once("error", reject);
-        readyServer.listen(0, "127.0.0.1", resolve);
-      });
-      const address = readyServer.address();
-      if (!address || typeof address === "string") {
-        throw new Error("Knip readiness server did not expose a TCP port");
-      }
-      readyPort = address.port;
+    if (preloadSource && timeoutPidPaths.length === 0) {
+      throw new Error("Knip timeout preload requires PID paths");
     }
 
     writeFileSync(pnpmExecPath, childSource, "utf8");
@@ -217,83 +180,38 @@ async function runKnipCliFixture({
         ...process.env,
         npm_execpath: pnpmExecPath,
         OPENCLAW_TEST_EXIT_MARKER: exitMarkerPath,
+        OPENCLAW_TEST_KNIP_TIMEOUT_PID_PATHS: JSON.stringify(timeoutPidPaths),
         ...extraEnv,
-        ...(readyPort === undefined ? {} : { OPENCLAW_TEST_KNIP_READY_PORT: String(readyPort) }),
       },
       onReady(child) {
         child.stderr?.setEncoding("utf8");
         child.stderr?.on("data", (chunk) => {
           stderr += String(chunk);
         });
-        child.on("message", (message) => {
-          if (
-            !message ||
-            typeof message !== "object" ||
-            !("kind" in message) ||
-            message.kind !== KNIP_TIMEOUT_ARMED_MESSAGE
-          ) {
-            return;
-          }
-          if (timeoutArmed) {
-            triggerError = new Error("Knip timeout fixture armed more than once");
-            terminateManagedChild(child, "SIGKILL");
-            return;
-          }
-          timeoutArmed = true;
-          triggerPromise = (async () => {
-            const readyPids = readyPidsPromise ? await readyPidsPromise : [];
-            for (const [index, pidPath] of timeoutPidPaths.entries()) {
-              const pid = readyPids[index];
-              if (!isProcessAlive(pid)) {
-                throw new Error(`Knip timeout fixture process exited before trigger: ${pid}`);
-              }
-              if (readRecordedPidForCleanup(pidPath) !== pid) {
-                throw new Error(`Knip timeout fixture PID record mismatched readiness: ${pid}`);
-              }
-            }
-            if (!child.connected) {
-              throw new Error("Knip timeout fixture disconnected before trigger");
-            }
-            await new Promise<void>((resolve, reject) => {
-              child.send({ kind: KNIP_TIMEOUT_TRIGGER_MESSAGE }, (error) => {
-                if (error) {
-                  reject(error);
-                  return;
-                }
-                resolve();
-              });
-            });
-          })().catch((error: unknown) => {
-            triggerError = error;
-            terminateManagedChild(child, "SIGKILL");
-          });
-        });
       },
       shell: false,
-      stdio: preloadSource ? ["ignore", "ignore", "pipe", "ipc"] : ["ignore", "ignore", "pipe"],
+      stdio: ["ignore", "ignore", "pipe"],
       timeoutMs: KNIP_CLI_FIXTURE_TIMEOUT_MS,
+    }).catch((error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error);
+      const recordedPids = timeoutPidPaths.map(readRecordedPidForCleanup);
+      const stderrDetails = stderr.trim();
+      throw new Error(
+        [
+          message,
+          `Knip fixture recorded PIDs: ${JSON.stringify(recordedPids)}`,
+          ...(stderrDetails ? ["Knip fixture stderr:", stderrDetails] : []),
+        ].join("\n"),
+        { cause: error },
+      );
     });
 
-    await triggerPromise;
-    if (triggerError) {
-      throw triggerError instanceof Error
-        ? triggerError
-        : new Error("Knip timeout fixture trigger failed", { cause: triggerError });
-    }
-    if (timeoutPidPaths.length > 0 && !timeoutArmed) {
-      throw new Error("Knip timeout fixture exited before arming");
-    }
     return {
       exitMarker: existsSync(exitMarkerPath) ? readFileSync(exitMarkerPath, "utf8") : "",
       status,
       stderr,
     };
   } finally {
-    if (readyServer.listening) {
-      await new Promise<void>((resolve) => {
-        readyServer.close(() => resolve());
-      });
-    }
     rmSync(root, { recursive: true, force: true });
   }
 }
@@ -810,7 +728,6 @@ setTimeout(() => {
   });
   fs.writeFileSync(process.env.OPENCLAW_TEST_CHILD_PID, String(process.pid));
   fs.writeFileSync(process.env.OPENCLAW_TEST_DESCENDANT_PID, String(descendant.pid));
-  ${createKnipReadySignalSource(["process.pid", "descendant.pid"])}
 }, 50);
 setInterval(() => {}, 1000);
 `,
@@ -982,7 +899,6 @@ process.once("SIGTERM", () => {
 });
 setTimeout(() => {
   fs.writeFileSync(process.env.OPENCLAW_TEST_CHILD_PID, String(process.pid));
-  ${createKnipReadySignalSource(["process.pid"])}
 }, 50);
 setInterval(() => {}, 1000);
 `,
