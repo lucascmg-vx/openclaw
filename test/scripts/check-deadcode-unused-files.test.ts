@@ -2,6 +2,7 @@
 import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createServer } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -112,6 +113,22 @@ globalThis.setTimeout = (callback, delay, ...args) => {
 `;
 }
 
+function createKnipReadySignalSource(pidExpressions: string[]): string {
+  return `
+const readySocket = require("node:net").connect(
+  {
+    host: "127.0.0.1",
+    port: Number(process.env.OPENCLAW_TEST_KNIP_READY_PORT),
+  },
+  () => readySocket.end(JSON.stringify({ pids: [${pidExpressions.join(", ")}] })),
+);
+readySocket.once("error", (error) => {
+  process.stderr.write(\`Knip readiness signal failed: \${error.message}\\n\`);
+  process.exit(2);
+});
+`;
+}
+
 async function runKnipCliFixture({
   childSource,
   extraEnv,
@@ -131,8 +148,52 @@ async function runKnipCliFixture({
   let timeoutArmed = false;
   let triggerError: unknown;
   let triggerPromise = Promise.resolve();
+  let readyPort: number | undefined;
+  let readyPidsPromise: Promise<number[]> | undefined;
+  const readyServer = createServer();
 
   try {
+    if (timeoutPidPaths.length > 0) {
+      readyPidsPromise = new Promise<number[]>((resolve, reject) => {
+        readyServer.once("connection", (socket) => {
+          let payload = "";
+          socket.setEncoding("utf8");
+          socket.on("data", (chunk) => {
+            payload += String(chunk);
+          });
+          socket.once("error", reject);
+          socket.once("end", () => {
+            try {
+              const parsed = JSON.parse(payload) as { pids?: unknown };
+              if (
+                !Array.isArray(parsed.pids) ||
+                parsed.pids.length !== timeoutPidPaths.length ||
+                !parsed.pids.every((pid) => Number.isSafeInteger(pid) && Number(pid) > 0)
+              ) {
+                throw new Error("Knip readiness signal contained invalid PIDs");
+              }
+              resolve(parsed.pids as number[]);
+            } catch (error) {
+              reject(
+                error instanceof Error
+                  ? error
+                  : new Error("Knip readiness signal parsing failed", { cause: error }),
+              );
+            }
+          });
+        });
+      });
+      await new Promise<void>((resolve, reject) => {
+        readyServer.once("error", reject);
+        readyServer.listen(0, "127.0.0.1", resolve);
+      });
+      const address = readyServer.address();
+      if (!address || typeof address === "string") {
+        throw new Error("Knip readiness server did not expose a TCP port");
+      }
+      readyPort = address.port;
+    }
+
     writeFileSync(pnpmExecPath, childSource, "utf8");
     const nodeArgs = [];
     if (preloadSource) {
@@ -150,6 +211,7 @@ async function runKnipCliFixture({
         npm_execpath: pnpmExecPath,
         OPENCLAW_TEST_EXIT_MARKER: exitMarkerPath,
         ...extraEnv,
+        ...(readyPort === undefined ? {} : { OPENCLAW_TEST_KNIP_READY_PORT: String(readyPort) }),
       },
       onReady(child) {
         child.stderr?.setEncoding("utf8");
@@ -172,10 +234,14 @@ async function runKnipCliFixture({
           }
           timeoutArmed = true;
           triggerPromise = (async () => {
-            for (const pidPath of timeoutPidPaths) {
-              const pid = await waitForPidFile(pidPath, 2_000);
+            const readyPids = readyPidsPromise ? await readyPidsPromise : [];
+            for (const [index, pidPath] of timeoutPidPaths.entries()) {
+              const pid = readyPids[index];
               if (!isProcessAlive(pid)) {
                 throw new Error(`Knip timeout fixture process exited before trigger: ${pid}`);
+              }
+              if (readRecordedPidForCleanup(pidPath) !== pid) {
+                throw new Error(`Knip timeout fixture PID record mismatched readiness: ${pid}`);
               }
             }
             if (!child.connected) {
@@ -216,6 +282,11 @@ async function runKnipCliFixture({
       stderr,
     };
   } finally {
+    if (readyServer.listening) {
+      await new Promise<void>((resolve) => {
+        readyServer.close(() => resolve());
+      });
+    }
     rmSync(root, { recursive: true, force: true });
   }
 }
@@ -690,6 +761,7 @@ setTimeout(() => {
   });
   fs.writeFileSync(process.env.OPENCLAW_TEST_CHILD_PID, String(process.pid));
   fs.writeFileSync(process.env.OPENCLAW_TEST_DESCENDANT_PID, String(descendant.pid));
+  ${createKnipReadySignalSource(["process.pid", "descendant.pid"])}
 }, 50);
 setInterval(() => {}, 1000);
 `,
@@ -861,6 +933,7 @@ process.once("SIGTERM", () => {
 });
 setTimeout(() => {
   fs.writeFileSync(process.env.OPENCLAW_TEST_CHILD_PID, String(process.pid));
+  ${createKnipReadySignalSource(["process.pid"])}
 }, 50);
 setInterval(() => {}, 1000);
 `,
