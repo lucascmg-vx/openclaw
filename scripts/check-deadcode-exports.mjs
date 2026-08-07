@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Enforces a hard-zero policy for Knip's unused exports.
-import { fileURLToPath } from "node:url";
 import { isLikelyRepoFilePath, runKnip, uniqueSorted } from "./deadcode-knip-runner.mjs";
+import { isDirectRunUrl } from "./lib/direct-run.mjs";
 
 const KNIP_ISSUES = "exports,nsExports,types,nsTypes,enumMembers,namespaceMembers";
 
@@ -156,6 +156,6 @@ function reportUnusedExportScan(scan, result) {
   return true;
 }
 
-if (process.argv[1] === fileURLToPath(import.meta.url)) {
+if (isDirectRunUrl(process.argv[1], import.meta.url)) {
   await main();
 }

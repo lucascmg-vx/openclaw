@@ -8,7 +8,10 @@ import { isDirectRunPath } from "../../scripts/lib/direct-run.mjs";
 const DIRECT_RUN_SCRIPTS = [
   "scripts/android-app-i18n.ts",
   "scripts/android-pin-version.ts",
+  "scripts/check-deadcode-exports.mjs",
+  "scripts/check-deadcode-unused-files.mjs",
   "scripts/ci-run-timings.mjs",
+  "scripts/deadcode-knip-runner.mjs",
   "scripts/e2e/lib/package-compat.mjs",
   "scripts/generate-bundled-channel-config-metadata.ts",
   "scripts/plan-release-workflow-matrix.mjs",

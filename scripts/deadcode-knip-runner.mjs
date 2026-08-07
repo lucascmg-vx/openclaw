@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { fileURLToPath } from "node:url";
+import { isDirectRunUrl } from "./lib/direct-run.mjs";
 import { runWithFailedTrailer } from "./lib/failed-trailer.mjs";
 import { terminateManagedChild } from "./lib/managed-child-process.mjs";
 import { createPnpmRunnerSpawnSpec } from "./pnpm-runner.mjs";
@@ -345,6 +345,6 @@ async function main() {
   process.exitCode = exitCode;
 }
 
-if (process.argv[1] === fileURLToPath(import.meta.url)) {
+if (isDirectRunUrl(process.argv[1], import.meta.url)) {
   await runWithFailedTrailer("deadcode", main);
 }

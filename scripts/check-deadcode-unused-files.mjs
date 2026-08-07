@@ -1,12 +1,12 @@
 #!/usr/bin/env node
 // Enforces a hard-zero policy for Knip's unused files.
-import { fileURLToPath } from "node:url";
 import {
   isLikelyRepoFilePath,
   KNIP_MAX_BUFFER_BYTES,
   runKnip,
   uniqueSorted,
 } from "./deadcode-knip-runner.mjs";
+import { isDirectRunUrl } from "./lib/direct-run.mjs";
 
 export { KNIP_MAX_BUFFER_BYTES };
 
@@ -131,6 +131,6 @@ function reportUnusedFileScan(scan, result) {
   return true;
 }
 
-if (process.argv[1] === fileURLToPath(import.meta.url)) {
+if (isDirectRunUrl(process.argv[1], import.meta.url)) {
   await main();
 }

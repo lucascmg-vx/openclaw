@@ -31,6 +31,9 @@ class FakeKnipProcess extends EventEmitter {
   signalCode: NodeJS.Signals | null = null;
 }
 
+// Windows cleanup can spend 10s each on graceful and forced taskkill attempts.
+const KNIP_CLI_FIXTURE_TIMEOUT_MS = 30_000;
+
 function finishFakeProcess(
   child: FakeKnipProcess,
   status: number | null,
@@ -40,6 +43,18 @@ function finishFakeProcess(
   child.signalCode = signal;
   child.emit("exit", status, signal);
   child.emit("close", status, signal);
+}
+
+function readRecordedPid(pidPath: string): number {
+  if (!existsSync(pidPath)) {
+    return 0;
+  }
+  try {
+    const pid = Number(readFileSync(pidPath, "utf8"));
+    return Number.isSafeInteger(pid) && pid > 0 ? pid : 0;
+  } catch {
+    return 0;
+  }
 }
 
 function runKnipCliFixture({
@@ -75,7 +90,7 @@ function runKnipCliFixture({
         ...extraEnv,
       },
       stdio: ["ignore", "ignore", "pipe"],
-      timeout: 5_000,
+      timeout: KNIP_CLI_FIXTURE_TIMEOUT_MS,
     });
 
     if (result.error) {
@@ -281,7 +296,7 @@ Delete the files or model their real entrypoints in Knip.`,
         "--no-config-hints",
       ],
       options: {
-        detached: process.platform !== "win32",
+        detached: true,
         shell: false,
         stdio: ["ignore", "pipe", "pipe"],
       },
@@ -568,8 +583,8 @@ globalThis.setTimeout = (callback, delay, ...args) =>
 `,
         });
 
-        childPid = Number(readFileSync(childPidPath, "utf8"));
-        descendantPid = Number(readFileSync(descendantPidPath, "utf8"));
+        childPid = readRecordedPid(childPidPath);
+        descendantPid = readRecordedPid(descendantPidPath);
         expect(result.status).toBe(1);
         expect(result.stderr).toContain("[deadcode] Knip command timed out");
         expect(
@@ -581,6 +596,8 @@ globalThis.setTimeout = (callback, delay, ...args) =>
         await waitForDead(childPid, 2_000);
         await waitForDead(descendantPid, 2_000);
       } finally {
+        childPid ||= readRecordedPid(childPidPath);
+        descendantPid ||= readRecordedPid(descendantPidPath);
         if (childPid && isProcessAlive(childPid)) {
           process.kill(childPid, "SIGKILL");
         }
