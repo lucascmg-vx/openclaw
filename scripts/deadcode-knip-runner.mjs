@@ -112,11 +112,11 @@ export async function runKnip(knipArgs, params = {}) {
   return await new Promise((resolve) => {
     const startedAt = Date.now();
     let settled = false;
-    let timedOut = false;
-    let bufferExceeded = false;
+    let terminalFailure;
     let outputBytes = 0;
     const output = [];
     let killTimer;
+    let timeoutTimer;
     let exitStatus = null;
     let exitSignal = null;
 
@@ -169,9 +169,15 @@ export async function runKnip(knipArgs, params = {}) {
         return;
       }
       settled = true;
-      clearTimeout(timeoutTimer);
+      if (timeoutTimer) {
+        clearTimeout(timeoutTimer);
+        timeoutTimer = undefined;
+      }
       clearInterval(heartbeatTimer);
-      clearTimeout(killTimer);
+      if (killTimer) {
+        clearTimeout(killTimer);
+        killTimer = undefined;
+      }
       cleanupParentSignalHandlers();
       resolve({ ...result, output: output.join("") });
     };
@@ -207,16 +213,38 @@ export async function runKnip(knipArgs, params = {}) {
       return false;
     };
     const scheduleForceKill = (failureResult) => {
-      if (platform === "win32") {
+      if (platform === "win32" || settled || killTimer) {
         return;
       }
       killTimer = setTimeout(() => {
+        killTimer = undefined;
+        if (settled || terminalFailure !== failureResult) {
+          return;
+        }
         terminateChild("SIGKILL", failureResult);
       }, killGraceMs);
     };
+    // Timeout and output capping compete; the first cause owns cleanup and the result.
+    const claimTerminalFailure = (failureResult) => {
+      if (settled || terminalFailure) {
+        return false;
+      }
+      terminalFailure = failureResult;
+      if (timeoutTimer) {
+        clearTimeout(timeoutTimer);
+        timeoutTimer = undefined;
+      }
+      clearInterval(heartbeatTimer);
+      return true;
+    };
+    const terminateForFailure = (failureResult) => {
+      if (terminateChild("SIGTERM", failureResult)) {
+        scheduleForceKill(failureResult);
+      }
+    };
 
     const appendOutput = (chunk) => {
-      if (settled || bufferExceeded) {
+      if (settled || terminalFailure) {
         return;
       }
       const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
@@ -230,7 +258,15 @@ export async function runKnip(knipArgs, params = {}) {
         output.push(buffer.subarray(0, remainingBytes).toString("utf8"));
         outputBytes = maxBufferBytes;
       }
-      bufferExceeded = true;
+      const failureResult = {
+        errorCode: "ENOBUFS",
+        errorMessage: `Knip ${scanName} exceeded ${maxBufferBytes} output bytes`,
+        signal: exitSignal,
+        status: exitStatus,
+      };
+      if (!claimTerminalFailure(failureResult)) {
+        return;
+      }
       writeStatus(
         `[deadcode] Knip ${scanName} exceeded ${maxBufferBytes} output bytes; terminating.`,
       );
@@ -238,26 +274,13 @@ export async function runKnip(knipArgs, params = {}) {
       child.stderr?.off?.("data", appendOutput);
       child.stdout?.destroy?.();
       child.stderr?.destroy?.();
-      clearInterval(heartbeatTimer);
-      const failureResult = {
-        errorCode: "ENOBUFS",
-        errorMessage: `Knip ${scanName} exceeded ${maxBufferBytes} output bytes`,
-        signal: exitSignal,
-        status: exitStatus,
-      };
-      if (terminateChild("SIGTERM", failureResult)) {
-        scheduleForceKill(failureResult);
-      }
+      terminateForFailure(failureResult);
     };
 
     child.stdout?.on("data", appendOutput);
     child.stderr?.on("data", appendOutput);
-    const timeoutTimer = setTimeout(() => {
-      timedOut = true;
-      clearInterval(heartbeatTimer);
-      writeStatus(
-        `[deadcode] Knip ${scanName} timed out after ${Math.round(timeoutMs / 1000)}s; terminating.`,
-      );
+    timeoutTimer = setTimeout(() => {
+      timeoutTimer = undefined;
       const failureResult = {
         errorCode: "ETIMEDOUT",
         errorMessage: `Knip ${scanName} timed out after ${Math.round(
@@ -266,18 +289,25 @@ export async function runKnip(knipArgs, params = {}) {
         signal: exitSignal,
         status: exitStatus,
       };
-      if (terminateChild("SIGTERM", failureResult)) {
-        scheduleForceKill(failureResult);
+      if (!claimTerminalFailure(failureResult)) {
+        return;
       }
+      writeStatus(
+        `[deadcode] Knip ${scanName} timed out after ${Math.round(timeoutMs / 1000)}s; terminating.`,
+      );
+      terminateForFailure(failureResult);
     }, timeoutMs);
-    child.on("error", (error) =>
+    child.on("error", (error) => {
+      if (terminalFailure) {
+        return;
+      }
       finish({
         errorCode: spawnErrorCode(error),
         errorMessage: error.message,
         signal: null,
         status: null,
-      }),
-    );
+      });
+    });
     child.on("exit", (status, signal) => {
       exitStatus = status;
       exitSignal = signal;
@@ -285,20 +315,9 @@ export async function runKnip(knipArgs, params = {}) {
     child.on("close", (status, signal) => {
       exitStatus = exitStatus ?? status;
       exitSignal = exitSignal ?? signal;
-      const elapsedSeconds = Math.round((Date.now() - startedAt) / 1000);
-      if (timedOut) {
+      if (terminalFailure) {
         void finishAfterProcessTreeCleanup({
-          errorCode: "ETIMEDOUT",
-          errorMessage: `Knip ${scanName} timed out after ${elapsedSeconds}s`,
-          signal: exitSignal,
-          status: exitStatus,
-        });
-        return;
-      }
-      if (bufferExceeded) {
-        void finishAfterProcessTreeCleanup({
-          errorCode: "ENOBUFS",
-          errorMessage: `Knip ${scanName} exceeded ${maxBufferBytes} output bytes`,
+          ...terminalFailure,
           signal: exitSignal,
           status: exitStatus,
         });

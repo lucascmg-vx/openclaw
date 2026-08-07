@@ -391,7 +391,7 @@ Delete the files or model their real entrypoints in Knip.`,
 
   it("fails closed when Windows process-tree cleanup is indeterminate", async () => {
     const child = new FakeKnipProcess();
-    const runTaskkill = vi.fn(() => ({
+    const runTaskkill = vi.fn((_command: string, _args: string[]) => ({
       error: Object.assign(new Error("taskkill timed out"), { code: "ETIMEDOUT" }),
       status: null,
     }));
@@ -644,6 +644,62 @@ globalThis.setTimeout = (callback, delay, ...args) =>
       });
     } finally {
       process.kill = originalKill;
+    }
+  });
+
+  it("keeps output-cap cleanup exclusive when the timeout would overlap", async () => {
+    vi.useFakeTimers();
+    const child = new FakeKnipProcess();
+    const originalKill = process.kill.bind(process);
+    const kills: Array<NodeJS.Signals | number | undefined> = [];
+    const statuses: string[] = [];
+    let childAlive = true;
+    process.kill = ((pid: number, signal?: NodeJS.Signals | number) => {
+      if (Math.abs(pid) === child.pid) {
+        if (signal === 0) {
+          if (childAlive) {
+            return true;
+          }
+          throw Object.assign(new Error("gone"), { code: "ESRCH" });
+        }
+        kills.push(signal);
+        return true;
+      }
+      return originalKill(pid, signal as NodeJS.Signals);
+    }) as typeof process.kill;
+
+    try {
+      const resultPromise = runKnipUnusedFiles({
+        killGraceMs: 40,
+        maxBufferBytes: 1,
+        platform: "linux",
+        spawnCommand: () => child,
+        timeoutMs: 20,
+        writeStatus: (message: string) => statuses.push(message),
+      });
+      child.stdout.emit("data", "too much output");
+      setTimeout(() => {
+        childAlive = false;
+        finishFakeProcess(child, 0, null);
+      }, 30);
+
+      await vi.advanceTimersByTimeAsync(30);
+      await expect(resultPromise).resolves.toStrictEqual({
+        errorCode: "ENOBUFS",
+        errorMessage: "Knip production unused-file scan exceeded 1 output bytes",
+        output: "t",
+        signal: null,
+        status: 0,
+      });
+      await vi.advanceTimersByTimeAsync(100);
+
+      expect(statuses).toEqual([
+        "[deadcode] Knip production unused-file scan exceeded 1 output bytes; terminating.",
+      ]);
+      expect(kills).toEqual(["SIGTERM"]);
+    } finally {
+      process.kill = originalKill;
+      vi.useRealTimers();
     }
   });
 
