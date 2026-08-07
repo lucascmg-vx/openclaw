@@ -52,6 +52,13 @@ function finishFakeProcess(
   child.emit("close", status, signal);
 }
 
+function createSuccessfulTaskkill(child: FakeKnipProcess) {
+  return vi.fn((_command: string, _args: string[]) => {
+    queueMicrotask(() => finishFakeProcess(child, null, "SIGKILL"));
+    return { error: undefined, status: 0 };
+  });
+}
+
 function readRecordedPidForCleanup(pidPath: string): number | undefined {
   if (!existsSync(pidPath)) {
     return undefined;
@@ -605,11 +612,8 @@ Delete the files or model their real entrypoints in Knip.`,
       writeStatus: () => {},
     });
 
-    expect(runTaskkill.mock.calls.map(([, args]) => args)).toEqual([
-      ["/PID", "12345", "/T"],
-      ["/PID", "12345", "/T", "/F"],
-    ]);
-    expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+    expect(runTaskkill.mock.calls.map(([, args]) => args)).toEqual([["/PID", "12345", "/T", "/F"]]);
+    expect(child.kill).toHaveBeenCalledWith("SIGKILL");
     expect(child.unref).toHaveBeenCalledOnce();
     expect(result).toMatchObject({
       errorCode: "EPROCESSGROUP_CLEANUP_FAILED",
@@ -620,6 +624,51 @@ Delete the files or model their real entrypoints in Knip.`,
       signal: null,
       status: null,
     });
+  });
+
+  it.each([
+    {
+      errorCode: "ETIMEDOUT",
+      name: "timeout",
+      startFailure: (child: FakeKnipProcess) => {
+        const runTaskkill = createSuccessfulTaskkill(child);
+        return {
+          result: runKnipUnusedFiles({
+            platform: "win32",
+            runTaskkill,
+            spawnCommand: () => child,
+            timeoutMs: 5,
+            writeStatus: () => {},
+          }),
+          runTaskkill,
+        };
+      },
+    },
+    {
+      errorCode: "ENOBUFS",
+      name: "output cap",
+      startFailure: (child: FakeKnipProcess) => {
+        const runTaskkill = createSuccessfulTaskkill(child);
+        const result = runKnipUnusedFiles({
+          maxBufferBytes: 1,
+          platform: "win32",
+          runTaskkill,
+          spawnCommand: () => child,
+          timeoutMs: 60_000,
+          writeStatus: () => {},
+        });
+        child.stdout.emit("data", Buffer.from("xx"));
+        return { result, runTaskkill };
+      },
+    },
+  ])("force-kills Windows process trees after a $name", async ({ errorCode, startFailure }) => {
+    const child = new FakeKnipProcess();
+    const { result: resultPromise, runTaskkill } = startFailure(child);
+    const result = await resultPromise;
+
+    expect(result.errorCode).toBe(errorCode);
+    expect(runTaskkill.mock.calls.map(([, args]) => args)).toEqual([["/PID", "12345", "/T", "/F"]]);
+    expect(child.kill).not.toHaveBeenCalled();
   });
 
   it.skipIf(process.platform === "win32")(

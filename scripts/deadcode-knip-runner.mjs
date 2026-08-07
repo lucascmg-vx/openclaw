@@ -238,7 +238,10 @@ export async function runKnip(knipArgs, params = {}) {
       return true;
     };
     const terminateForFailure = (failureResult) => {
-      if (terminateChild("SIGTERM", failureResult)) {
+      // Windows terminal failures need taskkill /T /F: graceful taskkill can
+      // report success without giving this wrapper a process-close handshake.
+      const signal = platform === "win32" ? "SIGKILL" : "SIGTERM";
+      if (terminateChild(signal, failureResult)) {
         scheduleForceKill(failureResult);
       }
     };
