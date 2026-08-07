@@ -544,6 +544,12 @@ describe("detectChangedScope", () => {
       runControlUiI18n: false,
       runUiTests: false,
     });
+    for (const knipPath of [
+      "scripts/deadcode-knip-runner.mjs",
+      "test/scripts/check-deadcode-unused-files.test.ts",
+    ]) {
+      expect(detectChangedScope([knipPath]).runWindows, knipPath).toBe(true);
+    }
     for (const releaseCheckPath of [
       ".github/workflows/openclaw-cross-os-release-checks-reusable.yml",
       "scripts/github/run-openclaw-cross-os-release-checks.sh",

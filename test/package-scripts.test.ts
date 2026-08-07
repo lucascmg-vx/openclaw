@@ -185,6 +185,12 @@ describe("package scripts", () => {
     );
   });
 
+  it("runs Knip process-tree cleanup coverage in Windows CI", () => {
+    expect(readPackageJson().scripts["test:windows:ci"]).toContain(
+      "test/scripts/check-deadcode-unused-files.test.ts",
+    );
+  });
+
   it("runs direct-run entrypoint coverage in Windows CI", () => {
     expect(readPackageJson().scripts["test:windows:ci"]).toContain(
       "test/scripts/direct-run-entrypoints.test.ts",
