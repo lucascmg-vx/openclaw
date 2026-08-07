@@ -175,13 +175,15 @@ describe("check-deadcode-exports", () => {
       fs.readFileSync(new URL("../../package.json", import.meta.url), "utf8"),
     ) as { scripts: Record<string, string> };
     expect(packageJson.scripts["deadcode:dependencies"]).toBe("pnpm deadcode:full");
-    expect(packageJson.scripts["deadcode:full"]).toContain(
-      "--config config/knip.config.ts --production",
+    expect(packageJson.scripts["deadcode:full"]).toBe(
+      "node scripts/deadcode-knip-runner.mjs --config config/knip.config.ts --production --no-progress --reporter compact --no-config-hints --exclude duplicates && node scripts/deadcode-knip-runner.mjs --config config/knip.all-exports.config.ts --no-progress --reporter compact --no-config-hints --exclude duplicates",
     );
-    expect(packageJson.scripts["deadcode:full"]).toContain(
-      "--config config/knip.all-exports.config.ts",
+    expect(packageJson.scripts["deadcode:knip"]).toBe(
+      "node scripts/deadcode-knip-runner.mjs --config config/knip.config.ts --production --no-progress --reporter compact --files --dependencies",
     );
-    expect(packageJson.scripts["deadcode:full"]).toContain("--exclude duplicates");
+    for (const [name, command] of Object.entries(packageJson.scripts)) {
+      expect(command, name).not.toMatch(/\bdlx\b.*\bknip\b/u);
+    }
   });
 
   it("models the jiti virtual agent-sessions SDK entry", () => {

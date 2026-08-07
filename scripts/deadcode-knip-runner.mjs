@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { createPnpmRunnerSpawnSpec } from "./pnpm-runner.mjs";
 
 const KNIP_VERSION = "6.8.0";
@@ -7,6 +8,12 @@ const KNIP_KILL_GRACE_MS = 5_000;
 const KNIP_PROCESS_TREE_EXIT_POLL_MS = 25;
 const KNIP_POST_FORCE_KILL_WAIT_MS = 1_000;
 const KNIP_HEARTBEAT_MS = 60_000;
+const PNPM_DLX_LAYOUT_ENV_KEYS = new Set([
+  "PNPM_CONFIG_MODULES_DIR",
+  "PNPM_CONFIG_VIRTUAL_STORE_DIR",
+  "pnpm_config_modules_dir",
+  "pnpm_config_virtual_store_dir",
+]);
 
 /** Maximum buffered Knip output retained for diagnostics. */
 export const KNIP_MAX_BUFFER_BYTES = 16 * 1024 * 1024;
@@ -34,6 +41,17 @@ export function isLikelyRepoFilePath(value) {
 
 function spawnErrorCode(error) {
   return error && typeof error === "object" && "code" in error ? String(error.code) : undefined;
+}
+
+function createKnipChildEnv(env, platform) {
+  const childEnv = { ...(env ?? process.env) };
+  for (const key of Object.keys(childEnv)) {
+    const comparableKey = platform === "win32" ? key.toLowerCase() : key;
+    if (PNPM_DLX_LAYOUT_ENV_KEYS.has(comparableKey)) {
+      delete childEnv[key];
+    }
+  }
+  return childEnv;
 }
 
 function signalProcessTree(child, signal) {
@@ -88,6 +106,7 @@ export async function runKnip(knipArgs, params = {}) {
   const killGraceMs = params.killGraceMs ?? KNIP_KILL_GRACE_MS;
   const scanName = params.scanName ?? "scan";
   const writeStatus = params.writeStatus ?? ((message) => process.stderr.write(`${message}\n`));
+  const platform = params.platform ?? process.platform;
   const args = [
     "--config.minimum-release-age=0",
     "dlx",
@@ -110,10 +129,10 @@ export async function runKnip(knipArgs, params = {}) {
 
     const pnpm = createPnpmRunnerSpawnSpec({
       detached: process.platform !== "win32",
-      env: params.env,
+      env: createKnipChildEnv(params.env, platform),
       nodeExecPath: params.nodeExecPath,
       npmExecPath: params.npmExecPath,
-      platform: params.platform,
+      platform,
       pnpmArgs: args,
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -255,4 +274,23 @@ export async function runKnip(knipArgs, params = {}) {
       });
     });
   });
+}
+
+async function main() {
+  const result = await runKnip(process.argv.slice(2), { scanName: "command" });
+  if (result.output) {
+    process.stdout.write(result.output);
+  }
+  const exitCode = result.status ?? 1;
+  if (result.errorMessage) {
+    process.stderr.write(`[deadcode] ${result.errorMessage}\n`);
+  }
+  if (exitCode !== 0) {
+    process.stderr.write(`[deadcode] FAILED (exit ${exitCode})\n`);
+  }
+  process.exitCode = exitCode;
+}
+
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  await main();
 }

@@ -233,6 +233,53 @@ Delete the files or model their real entrypoints in Knip.`,
     });
   });
 
+  it.each([
+    {
+      name: "POSIX structural keys",
+      platform: "linux" as const,
+      structuralEnv: {
+        PNPM_CONFIG_MODULES_DIR: "/upper-modules",
+        PNPM_CONFIG_VIRTUAL_STORE_DIR: "/upper-virtual-store",
+        pnpm_config_modules_dir: "/lower-modules",
+        pnpm_config_virtual_store_dir: "/lower-virtual-store",
+      },
+    },
+    {
+      name: "Windows mixed-case structural keys",
+      platform: "win32" as const,
+      structuralEnv: {
+        PnPm_CoNfIg_MoDuLeS_DiR: "C:\\mixed-modules",
+        pNpM_cOnFiG_vIrTuAl_StOrE_dIr: "C:\\mixed-virtual-store",
+      },
+    },
+  ])("removes $name only from the Knip child environment", async ({ platform, structuralEnv }) => {
+    const child = new FakeKnipProcess();
+    let spawnedEnv: NodeJS.ProcessEnv | undefined;
+    const preservedEnv = {
+      PATH: "",
+      PNPM_CONFIG_STORE_DIR: "/store",
+      pnpm_config_cache_dir: "/cache",
+      PNPM_CONFIG_REGISTRY: "https://registry.example.test/",
+      "pnpm_config_//registry.example.test/:_authToken": "token-value",
+      OPENCLAW_TEST_VALUE: "keep-me",
+    };
+
+    const resultPromise = runKnipUnusedFiles({
+      env: { ...structuralEnv, ...preservedEnv },
+      npmExecPath: "",
+      platform,
+      spawnCommand(_command: string, _args: string[], options: unknown) {
+        spawnedEnv = (options as { env?: NodeJS.ProcessEnv }).env;
+        queueMicrotask(() => finishFakeProcess(child, 0, null));
+        return child;
+      },
+      writeStatus: () => {},
+    });
+
+    await expect(resultPromise).resolves.toMatchObject({ status: 0 });
+    expect(spawnedEnv).toStrictEqual(preservedEnv);
+  });
+
   it("emits heartbeat status and reports Knip timeouts", async () => {
     const statuses: string[] = [];
     const child = new FakeKnipProcess();
