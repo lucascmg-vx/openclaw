@@ -1,5 +1,5 @@
 // Check Deadcode Unused Files tests cover check deadcode unused files script behavior.
-import { spawn, spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
@@ -13,6 +13,10 @@ import {
   parseKnipCompactUnusedFiles,
   runKnipUnusedFiles,
 } from "../../scripts/check-deadcode-unused-files.mjs";
+import {
+  runManagedCommand,
+  terminateManagedChild,
+} from "../../scripts/lib/managed-child-process.mjs";
 import {
   isProcessAlive,
   waitForChildClose,
@@ -33,6 +37,8 @@ class FakeKnipProcess extends EventEmitter {
 
 // Windows cleanup can spend 10s each on graceful and forced taskkill attempts.
 const KNIP_CLI_FIXTURE_TIMEOUT_MS = 30_000;
+const KNIP_TIMEOUT_ARMED_MESSAGE = "openclaw-test-knip-timeout-armed";
+const KNIP_TIMEOUT_TRIGGER_MESSAGE = "openclaw-test-knip-timeout-trigger";
 
 function finishFakeProcess(
   child: FakeKnipProcess,
@@ -57,19 +63,35 @@ function readRecordedPidForCleanup(pidPath: string): number | undefined {
   }
 }
 
-// Timeout proof starts only after the fixture has published valid PIDs; otherwise Windows
-// cleanup can race the open-truncate/zero-PID state and test the wrong process.
-function createReadyGatedKnipTimeoutPreload(): string {
+// The fixture owns timeout readiness: arm the real runner timer first, then let the
+// test trigger it only after every process PID is valid.
+function createControlledKnipTimeoutPreload(): string {
   return `
-import { existsSync } from "node:fs";
 const realSetTimeout = globalThis.setTimeout.bind(globalThis);
 const realClearTimeout = globalThis.clearTimeout.bind(globalThis);
-const realSetInterval = globalThis.setInterval.bind(globalThis);
-const realClearInterval = globalThis.clearInterval.bind(globalThis);
-const readinessIntervals = new WeakSet();
+const timeoutHandle = {};
+let timeoutCallback;
+const disconnect = () => {
+  process.off("message", onMessage);
+  if (process.connected) {
+    process.disconnect();
+  }
+};
+const onMessage = (message) => {
+  if (message?.kind !== ${JSON.stringify(KNIP_TIMEOUT_TRIGGER_MESSAGE)}) {
+    return;
+  }
+  const callback = timeoutCallback;
+  timeoutCallback = undefined;
+  disconnect();
+  callback?.();
+};
+process.on("message", onMessage);
 globalThis.clearTimeout = (timer) => {
-  if (timer && typeof timer === "object" && readinessIntervals.delete(timer)) {
-    return realClearInterval(timer);
+  if (timer === timeoutHandle) {
+    timeoutCallback = undefined;
+    disconnect();
+    return;
   }
   return realClearTimeout(timer);
 };
@@ -77,34 +99,38 @@ globalThis.setTimeout = (callback, delay, ...args) => {
   if (delay !== 600_000) {
     return realSetTimeout(callback, delay, ...args);
   }
-  const readyPath = process.env.OPENCLAW_TEST_KNIP_READY;
-  const interval = realSetInterval(() => {
-    if (!readyPath || !existsSync(readyPath)) {
-      return;
-    }
-    readinessIntervals.delete(interval);
-    realClearInterval(interval);
-    callback(...args);
-  }, 5);
-  readinessIntervals.add(interval);
-  return interval;
+  if (timeoutCallback) {
+    throw new Error("Knip timeout was armed more than once");
+  }
+  if (!process.send) {
+    throw new Error("Knip timeout fixture requires an IPC channel");
+  }
+  timeoutCallback = () => callback(...args);
+  process.send({ kind: ${JSON.stringify(KNIP_TIMEOUT_ARMED_MESSAGE)} });
+  return timeoutHandle;
 };
 `;
 }
 
-function runKnipCliFixture({
+async function runKnipCliFixture({
   childSource,
   extraEnv,
   preloadSource,
+  timeoutPidPaths = [],
 }: {
   childSource: string;
   extraEnv?: NodeJS.ProcessEnv;
   preloadSource?: string;
-}): { exitMarker: string; status: number | null; stderr: string } {
+  timeoutPidPaths?: string[];
+}): Promise<{ exitMarker: string; status: number; stderr: string }> {
   const root = mkdtempSync(path.join(os.tmpdir(), "openclaw-knip-cli-"));
   const exitMarkerPath = path.join(root, "exit-marker");
   const pnpmExecPath = path.join(root, "pnpm.cjs");
   const preloadPath = path.join(root, "preload.mjs");
+  let stderr = "";
+  let timeoutArmed = false;
+  let triggerError: unknown;
+  let triggerPromise = Promise.resolve();
 
   try {
     writeFileSync(pnpmExecPath, childSource, "utf8");
@@ -115,26 +141,79 @@ function runKnipCliFixture({
     }
     nodeArgs.push(path.resolve("scripts/deadcode-knip-runner.mjs"));
 
-    const result = spawnSync(process.execPath, nodeArgs, {
+    const status = await runManagedCommand({
+      args: nodeArgs,
+      bin: process.execPath,
       cwd: process.cwd(),
-      encoding: "utf8",
       env: {
         ...process.env,
         npm_execpath: pnpmExecPath,
         OPENCLAW_TEST_EXIT_MARKER: exitMarkerPath,
         ...extraEnv,
       },
-      stdio: ["ignore", "ignore", "pipe"],
-      timeout: KNIP_CLI_FIXTURE_TIMEOUT_MS,
+      onReady(child) {
+        child.stderr?.setEncoding("utf8");
+        child.stderr?.on("data", (chunk) => {
+          stderr += String(chunk);
+        });
+        child.on("message", (message) => {
+          if (
+            !message ||
+            typeof message !== "object" ||
+            !("kind" in message) ||
+            message.kind !== KNIP_TIMEOUT_ARMED_MESSAGE
+          ) {
+            return;
+          }
+          if (timeoutArmed) {
+            triggerError = new Error("Knip timeout fixture armed more than once");
+            terminateManagedChild(child, "SIGKILL");
+            return;
+          }
+          timeoutArmed = true;
+          triggerPromise = (async () => {
+            for (const pidPath of timeoutPidPaths) {
+              const pid = await waitForPidFile(pidPath, 2_000);
+              if (!isProcessAlive(pid)) {
+                throw new Error(`Knip timeout fixture process exited before trigger: ${pid}`);
+              }
+            }
+            if (!child.connected) {
+              throw new Error("Knip timeout fixture disconnected before trigger");
+            }
+            await new Promise<void>((resolve, reject) => {
+              child.send({ kind: KNIP_TIMEOUT_TRIGGER_MESSAGE }, (error) => {
+                if (error) {
+                  reject(error);
+                  return;
+                }
+                resolve();
+              });
+            });
+          })().catch((error: unknown) => {
+            triggerError = error;
+            terminateManagedChild(child, "SIGKILL");
+          });
+        });
+      },
+      shell: false,
+      stdio: preloadSource ? ["ignore", "ignore", "pipe", "ipc"] : ["ignore", "ignore", "pipe"],
+      timeoutMs: KNIP_CLI_FIXTURE_TIMEOUT_MS,
     });
 
-    if (result.error) {
-      throw result.error;
+    await triggerPromise;
+    if (triggerError) {
+      throw triggerError instanceof Error
+        ? triggerError
+        : new Error("Knip timeout fixture trigger failed", { cause: triggerError });
+    }
+    if (timeoutPidPaths.length > 0 && !timeoutArmed) {
+      throw new Error("Knip timeout fixture exited before arming");
     }
     return {
       exitMarker: existsSync(exitMarkerPath) ? readFileSync(exitMarkerPath, "utf8") : "",
-      status: result.status,
-      stderr: result.stderr,
+      status,
+      stderr,
     };
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -592,7 +671,6 @@ Delete the files or model their real entrypoints in Knip.`,
       const root = mkdtempSync(path.join(os.tmpdir(), "openclaw-knip-windows-timeout-"));
       const childPidPath = path.join(root, "child.pid");
       const descendantPidPath = path.join(root, "descendant.pid");
-      const readyMarkerPath = path.join(root, "ready");
       let childPid: number | undefined;
       let descendantPid: number | undefined;
 
@@ -602,7 +680,7 @@ Delete the files or model their real entrypoints in Knip.`,
         expect(readRecordedPidForCleanup(childPidPath)).toBeUndefined();
         expect(readRecordedPidForCleanup(descendantPidPath)).toBeUndefined();
 
-        const result = runKnipCliFixture({
+        const result = await runKnipCliFixture({
           childSource: `
 const { spawn } = require("node:child_process");
 const fs = require("node:fs");
@@ -612,16 +690,15 @@ setTimeout(() => {
   });
   fs.writeFileSync(process.env.OPENCLAW_TEST_CHILD_PID, String(process.pid));
   fs.writeFileSync(process.env.OPENCLAW_TEST_DESCENDANT_PID, String(descendant.pid));
-  fs.writeFileSync(process.env.OPENCLAW_TEST_KNIP_READY, "ready");
 }, 50);
 setInterval(() => {}, 1000);
 `,
           extraEnv: {
             OPENCLAW_TEST_CHILD_PID: childPidPath,
             OPENCLAW_TEST_DESCENDANT_PID: descendantPidPath,
-            OPENCLAW_TEST_KNIP_READY: readyMarkerPath,
           },
-          preloadSource: createReadyGatedKnipTimeoutPreload(),
+          preloadSource: createControlledKnipTimeoutPreload(),
+          timeoutPidPaths: [childPidPath, descendantPidPath],
         });
 
         childPid = await waitForPidFile(childPidPath, 2_000);
@@ -770,13 +847,12 @@ setInterval(() => {}, 1000);
     async () => {
       const root = mkdtempSync(path.join(os.tmpdir(), "openclaw-knip-cli-timeout-"));
       const childPidPath = path.join(root, "child.pid");
-      const readyMarkerPath = path.join(root, "ready");
       let childPid: number | undefined;
       try {
         writeFileSync(childPidPath, "0");
         expect(readRecordedPidForCleanup(childPidPath)).toBeUndefined();
 
-        const result = runKnipCliFixture({
+        const result = await runKnipCliFixture({
           childSource: `
 const fs = require("node:fs");
 process.once("SIGTERM", () => {
@@ -785,15 +861,14 @@ process.once("SIGTERM", () => {
 });
 setTimeout(() => {
   fs.writeFileSync(process.env.OPENCLAW_TEST_CHILD_PID, String(process.pid));
-  fs.writeFileSync(process.env.OPENCLAW_TEST_KNIP_READY, "ready");
 }, 50);
 setInterval(() => {}, 1000);
 `,
           extraEnv: {
             OPENCLAW_TEST_CHILD_PID: childPidPath,
-            OPENCLAW_TEST_KNIP_READY: readyMarkerPath,
           },
-          preloadSource: createReadyGatedKnipTimeoutPreload(),
+          preloadSource: createControlledKnipTimeoutPreload(),
+          timeoutPidPaths: [childPidPath],
         });
 
         childPid = await waitForPidFile(childPidPath, 2_000);
@@ -815,8 +890,8 @@ setInterval(() => {}, 1000);
 
   it.skipIf(process.platform === "win32")(
     "fails the CLI when an output-capped Knip child exits with status 0",
-    () => {
-      const result = runKnipCliFixture({
+    async () => {
+      const result = await runKnipCliFixture({
         childSource: `
 const fs = require("node:fs");
 process.stdout.on("error", () => {});
