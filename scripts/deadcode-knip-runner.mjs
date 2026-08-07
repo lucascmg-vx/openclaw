@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { runWithFailedTrailer } from "./lib/failed-trailer.mjs";
+import { terminateManagedChild } from "./lib/managed-child-process.mjs";
 import { createPnpmRunnerSpawnSpec } from "./pnpm-runner.mjs";
 
 const KNIP_VERSION = "6.8.0";
@@ -10,10 +11,10 @@ const KNIP_PROCESS_TREE_EXIT_POLL_MS = 25;
 const KNIP_POST_FORCE_KILL_WAIT_MS = 1_000;
 const KNIP_HEARTBEAT_MS = 60_000;
 const PNPM_DLX_LAYOUT_ENV_KEYS = new Set([
-  "PNPM_CONFIG_MODULES_DIR",
-  "PNPM_CONFIG_VIRTUAL_STORE_DIR",
   "pnpm_config_modules_dir",
   "pnpm_config_virtual_store_dir",
+  "npm_config_modules_dir",
+  "npm_config_virtual_store_dir",
 ]);
 
 /** Maximum buffered Knip output retained for diagnostics. */
@@ -44,38 +45,19 @@ function spawnErrorCode(error) {
   return error && typeof error === "object" && "code" in error ? String(error.code) : undefined;
 }
 
-function createKnipChildEnv(env, platform) {
+function createKnipChildEnv(env) {
   const childEnv = { ...(env ?? process.env) };
   for (const key of Object.keys(childEnv)) {
-    const comparableKey = platform === "win32" ? key.toLowerCase() : key;
-    if (PNPM_DLX_LAYOUT_ENV_KEYS.has(comparableKey)) {
+    if (PNPM_DLX_LAYOUT_ENV_KEYS.has(key.toLowerCase())) {
       delete childEnv[key];
     }
   }
   return childEnv;
 }
 
-function signalProcessTree(child, signal) {
-  if (!child.pid) {
-    return;
-  }
-  try {
-    if (process.platform === "win32") {
-      process.kill(child.pid, signal);
-    } else {
-      process.kill(-child.pid, signal);
-    }
-  } catch {
-    // The child may have exited between the timeout and signal delivery.
-  }
-}
-
-function processTreeAlive(child) {
-  if (!child.pid) {
+function processTreeAlive(child, platform) {
+  if (platform === "win32" || !child.pid) {
     return false;
-  }
-  if (process.platform === "win32") {
-    return child.exitCode === null && child.signalCode === null;
   }
   try {
     process.kill(-child.pid, 0);
@@ -85,17 +67,26 @@ function processTreeAlive(child) {
   }
 }
 
-async function waitForProcessTreeExit(child, timeoutMs) {
+async function waitForProcessTreeExit(child, platform, timeoutMs) {
   const deadlineAt = Date.now() + timeoutMs;
   while (Date.now() < deadlineAt) {
-    if (!processTreeAlive(child)) {
+    if (!processTreeAlive(child, platform)) {
       return true;
     }
     await new Promise((resolvePoll) => {
       setTimeout(resolvePoll, KNIP_PROCESS_TREE_EXIT_POLL_MS);
     });
   }
-  return !processTreeAlive(child);
+  return !processTreeAlive(child, platform);
+}
+
+function withProcessTreeCleanupFailure(result, platform) {
+  const platformName = platform === "win32" ? "Windows " : "";
+  return {
+    ...result,
+    errorCode: "EPROCESSGROUP_CLEANUP_FAILED",
+    errorMessage: `${result.errorMessage}; ${platformName}process tree cleanup could not be verified`,
+  };
 }
 
 /** Runs pinned Knip with the supplied CLI arguments. */
@@ -108,6 +99,7 @@ export async function runKnip(knipArgs, params = {}) {
   const scanName = params.scanName ?? "scan";
   const writeStatus = params.writeStatus ?? ((message) => process.stderr.write(`${message}\n`));
   const platform = params.platform ?? process.platform;
+  const runTaskkill = params.runTaskkill;
   const args = [
     "--config.minimum-release-age=0",
     "dlx",
@@ -129,8 +121,8 @@ export async function runKnip(knipArgs, params = {}) {
     let exitSignal = null;
 
     const pnpm = createPnpmRunnerSpawnSpec({
-      detached: process.platform !== "win32",
-      env: createKnipChildEnv(params.env, platform),
+      detached: platform !== "win32",
+      env: createKnipChildEnv(params.env),
       nodeExecPath: params.nodeExecPath,
       npmExecPath: params.npmExecPath,
       platform,
@@ -139,7 +131,7 @@ export async function runKnip(knipArgs, params = {}) {
     });
     const child = run(pnpm.command, pnpm.args, {
       ...pnpm.options,
-      detached: process.platform !== "win32",
+      detached: platform !== "win32",
       stdio: ["ignore", "pipe", "pipe"],
     });
     const parentSignalHandlers = [];
@@ -151,8 +143,10 @@ export async function runKnip(knipArgs, params = {}) {
     };
     const relayParentSignal = (signal) => {
       const handler = () => {
-        signalProcessTree(child, signal);
-        signalProcessTree(child, "SIGKILL");
+        terminateManagedChild(child, signal, { platform, runTaskkill });
+        if (platform !== "win32") {
+          terminateManagedChild(child, "SIGKILL", { platform });
+        }
         cleanupParentSignalHandlers();
         process.kill(process.pid, signal);
       };
@@ -170,17 +164,6 @@ export async function runKnip(knipArgs, params = {}) {
         `[deadcode] Knip ${scanName} still running after ${Math.round((Date.now() - startedAt) / 1000)}s.`,
       );
     }, heartbeatMs);
-
-    const timeoutTimer = setTimeout(() => {
-      timedOut = true;
-      clearInterval(heartbeatTimer);
-      writeStatus(
-        `[deadcode] Knip ${scanName} timed out after ${Math.round(timeoutMs / 1000)}s; terminating.`,
-      );
-      signalProcessTree(child, "SIGTERM");
-      killTimer = setTimeout(() => signalProcessTree(child, "SIGKILL"), killGraceMs);
-    }, timeoutMs);
-
     const finish = (result) => {
       if (settled) {
         return;
@@ -193,14 +176,43 @@ export async function runKnip(knipArgs, params = {}) {
       resolve({ ...result, output: output.join("") });
     };
     const finishAfterProcessTreeCleanup = async (result) => {
-      if (processTreeAlive(child)) {
-        await waitForProcessTreeExit(child, killGraceMs);
+      if (settled) {
+        return;
       }
-      if (processTreeAlive(child)) {
-        signalProcessTree(child, "SIGKILL");
-        await waitForProcessTreeExit(child, KNIP_POST_FORCE_KILL_WAIT_MS);
+      if (processTreeAlive(child, platform)) {
+        await waitForProcessTreeExit(child, platform, killGraceMs);
+      }
+      if (processTreeAlive(child, platform)) {
+        terminateManagedChild(child, "SIGKILL", { platform });
+        await waitForProcessTreeExit(child, platform, KNIP_POST_FORCE_KILL_WAIT_MS);
+      }
+      if (processTreeAlive(child, platform)) {
+        finish(withProcessTreeCleanupFailure(result, platform));
+        return;
       }
       finish(result);
+    };
+    const terminateChild = (signal, failureResult) => {
+      const termination = terminateManagedChild(child, signal, {
+        platform,
+        runTaskkill,
+      });
+      if (termination?.processTreeState !== "indeterminate") {
+        return true;
+      }
+      child.stdout?.destroy?.();
+      child.stderr?.destroy?.();
+      child.unref?.();
+      finish(withProcessTreeCleanupFailure(failureResult, platform));
+      return false;
+    };
+    const scheduleForceKill = (failureResult) => {
+      if (platform === "win32") {
+        return;
+      }
+      killTimer = setTimeout(() => {
+        terminateChild("SIGKILL", failureResult);
+      }, killGraceMs);
     };
 
     const appendOutput = (chunk) => {
@@ -227,12 +239,37 @@ export async function runKnip(knipArgs, params = {}) {
       child.stdout?.destroy?.();
       child.stderr?.destroy?.();
       clearInterval(heartbeatTimer);
-      signalProcessTree(child, "SIGTERM");
-      killTimer = setTimeout(() => signalProcessTree(child, "SIGKILL"), killGraceMs);
+      const failureResult = {
+        errorCode: "ENOBUFS",
+        errorMessage: `Knip ${scanName} exceeded ${maxBufferBytes} output bytes`,
+        signal: exitSignal,
+        status: exitStatus,
+      };
+      if (terminateChild("SIGTERM", failureResult)) {
+        scheduleForceKill(failureResult);
+      }
     };
 
     child.stdout?.on("data", appendOutput);
     child.stderr?.on("data", appendOutput);
+    const timeoutTimer = setTimeout(() => {
+      timedOut = true;
+      clearInterval(heartbeatTimer);
+      writeStatus(
+        `[deadcode] Knip ${scanName} timed out after ${Math.round(timeoutMs / 1000)}s; terminating.`,
+      );
+      const failureResult = {
+        errorCode: "ETIMEDOUT",
+        errorMessage: `Knip ${scanName} timed out after ${Math.round(
+          (Date.now() - startedAt) / 1000,
+        )}s`,
+        signal: exitSignal,
+        status: exitStatus,
+      };
+      if (terminateChild("SIGTERM", failureResult)) {
+        scheduleForceKill(failureResult);
+      }
+    }, timeoutMs);
     child.on("error", (error) =>
       finish({
         errorCode: spawnErrorCode(error),

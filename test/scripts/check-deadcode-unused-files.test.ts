@@ -5,7 +5,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "no
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   checkKnipUnusedFileScanResult,
   checkUnusedFiles,
@@ -22,9 +22,13 @@ import {
 } from "../helpers/process-wait.js";
 
 class FakeKnipProcess extends EventEmitter {
+  readonly kill = vi.fn(() => true);
   readonly stderr = new EventEmitter();
   readonly stdout = new EventEmitter();
+  readonly unref = vi.fn();
+  exitCode: number | null = null;
   pid = 12345;
+  signalCode: NodeJS.Signals | null = null;
 }
 
 function finishFakeProcess(
@@ -32,15 +36,19 @@ function finishFakeProcess(
   status: number | null,
   signal: NodeJS.Signals | null,
 ): void {
+  child.exitCode = status;
+  child.signalCode = signal;
   child.emit("exit", status, signal);
   child.emit("close", status, signal);
 }
 
 function runKnipCliFixture({
   childSource,
+  extraEnv,
   preloadSource,
 }: {
   childSource: string;
+  extraEnv?: NodeJS.ProcessEnv;
   preloadSource?: string;
 }): { exitMarker: string; status: number | null; stderr: string } {
   const root = mkdtempSync(path.join(os.tmpdir(), "openclaw-knip-cli-"));
@@ -64,6 +72,7 @@ function runKnipCliFixture({
         ...process.env,
         npm_execpath: pnpmExecPath,
         OPENCLAW_TEST_EXIT_MARKER: exitMarkerPath,
+        ...extraEnv,
       },
       stdio: ["ignore", "ignore", "pipe"],
       timeout: 5_000,
@@ -288,6 +297,10 @@ Delete the files or model their real entrypoints in Knip.`,
         PNPM_CONFIG_VIRTUAL_STORE_DIR: "/upper-virtual-store",
         pnpm_config_modules_dir: "/lower-modules",
         pnpm_config_virtual_store_dir: "/lower-virtual-store",
+        NPM_CONFIG_MODULES_DIR: "/npm-upper-modules",
+        NPM_CONFIG_VIRTUAL_STORE_DIR: "/npm-upper-virtual-store",
+        npm_config_modules_dir: "/npm-lower-modules",
+        npm_config_virtual_store_dir: "/npm-lower-virtual-store",
       },
     },
     {
@@ -296,6 +309,8 @@ Delete the files or model their real entrypoints in Knip.`,
       structuralEnv: {
         PnPm_CoNfIg_MoDuLeS_DiR: "C:\\mixed-modules",
         pNpM_cOnFiG_vIrTuAl_StOrE_dIr: "C:\\mixed-virtual-store",
+        NpM_cOnFiG_mOdUlEs_DiR: "C:\\npm-mixed-modules",
+        nPm_CoNfIg_ViRtUaL_sToRe_DiR: "C:\\npm-mixed-virtual-store",
       },
     },
   ])("removes $name only from the Knip child environment", async ({ platform, structuralEnv }) => {
@@ -303,7 +318,14 @@ Delete the files or model their real entrypoints in Knip.`,
     let spawnedEnv: NodeJS.ProcessEnv | undefined;
     const preservedEnv = {
       PATH: "",
+      NPM_CONFIG_CACHE: "/npm-upper-cache",
+      NPM_CONFIG_REGISTRY: "https://npm-upper-registry.example.test/",
+      NPM_CONFIG_STORE_DIR: "/npm-upper-store",
       PNPM_CONFIG_STORE_DIR: "/store",
+      npm_config_cache: "/npm-lower-cache",
+      npm_config_registry: "https://npm-lower-registry.example.test/",
+      npm_config_store_dir: "/npm-lower-store",
+      "npm_config_//npm.example.test/:_authToken": "npm-token-value",
       pnpm_config_cache_dir: "/cache",
       PNPM_CONFIG_REGISTRY: "https://registry.example.test/",
       "pnpm_config_//registry.example.test/:_authToken": "token-value",
@@ -365,6 +387,38 @@ Delete the files or model their real entrypoints in Knip.`,
     } finally {
       process.kill = originalKill;
     }
+  });
+
+  it("fails closed when Windows process-tree cleanup is indeterminate", async () => {
+    const child = new FakeKnipProcess();
+    const runTaskkill = vi.fn(() => ({
+      error: Object.assign(new Error("taskkill timed out"), { code: "ETIMEDOUT" }),
+      status: null,
+    }));
+
+    const result = await runKnipUnusedFiles({
+      platform: "win32",
+      runTaskkill,
+      spawnCommand: () => child,
+      timeoutMs: 5,
+      writeStatus: () => {},
+    });
+
+    expect(runTaskkill.mock.calls.map(([, args]) => args)).toEqual([
+      ["/PID", "12345", "/T"],
+      ["/PID", "12345", "/T", "/F"],
+    ]);
+    expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+    expect(child.unref).toHaveBeenCalledOnce();
+    expect(result).toMatchObject({
+      errorCode: "EPROCESSGROUP_CLEANUP_FAILED",
+      errorMessage: expect.stringMatching(
+        /^Knip production unused-file scan timed out after \d+s; Windows process tree cleanup could not be verified$/u,
+      ),
+      output: "",
+      signal: null,
+      status: null,
+    });
   });
 
   it.skipIf(process.platform === "win32")(
@@ -475,6 +529,62 @@ Delete the files or model their real entrypoints in Knip.`,
         }
         if (childPid && isProcessAlive(childPid)) {
           process.kill(childPid, "SIGKILL");
+        }
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.runIf(process.platform === "win32")(
+    "kills timed-out Knip descendants and preserves the final CLI failure trailer",
+    async () => {
+      const root = mkdtempSync(path.join(os.tmpdir(), "openclaw-knip-windows-timeout-"));
+      const childPidPath = path.join(root, "child.pid");
+      const descendantPidPath = path.join(root, "descendant.pid");
+      let childPid = 0;
+      let descendantPid = 0;
+
+      try {
+        const result = runKnipCliFixture({
+          childSource: `
+const { spawn } = require("node:child_process");
+const fs = require("node:fs");
+const descendant = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+  stdio: "ignore",
+});
+fs.writeFileSync(process.env.OPENCLAW_TEST_CHILD_PID, String(process.pid));
+fs.writeFileSync(process.env.OPENCLAW_TEST_DESCENDANT_PID, String(descendant.pid));
+setInterval(() => {}, 1000);
+`,
+          extraEnv: {
+            OPENCLAW_TEST_CHILD_PID: childPidPath,
+            OPENCLAW_TEST_DESCENDANT_PID: descendantPidPath,
+          },
+          preloadSource: `
+const realSetTimeout = globalThis.setTimeout;
+globalThis.setTimeout = (callback, delay, ...args) =>
+  realSetTimeout(callback, delay === 600_000 ? 250 : delay, ...args);
+`,
+        });
+
+        childPid = Number(readFileSync(childPidPath, "utf8"));
+        descendantPid = Number(readFileSync(descendantPidPath, "utf8"));
+        expect(result.status).toBe(1);
+        expect(result.stderr).toContain("[deadcode] Knip command timed out");
+        expect(
+          result.stderr
+            .trim()
+            .split(/\r?\n/u)
+            .filter((line) => line.startsWith("[deadcode] FAILED")),
+        ).toEqual(["[deadcode] FAILED (exit 1)"]);
+        await waitForDead(childPid, 2_000);
+        await waitForDead(descendantPid, 2_000);
+      } finally {
+        if (childPid && isProcessAlive(childPid)) {
+          process.kill(childPid, "SIGKILL");
+        }
+        if (descendantPid && isProcessAlive(descendantPid)) {
+          process.kill(descendantPid, "SIGKILL");
         }
         rmSync(root, { recursive: true, force: true });
       }
