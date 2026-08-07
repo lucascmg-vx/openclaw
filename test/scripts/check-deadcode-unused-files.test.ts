@@ -45,16 +45,51 @@ function finishFakeProcess(
   child.emit("close", status, signal);
 }
 
-function readRecordedPid(pidPath: string): number {
+function readRecordedPidForCleanup(pidPath: string): number | undefined {
   if (!existsSync(pidPath)) {
-    return 0;
+    return undefined;
   }
   try {
     const pid = Number(readFileSync(pidPath, "utf8"));
-    return Number.isSafeInteger(pid) && pid > 0 ? pid : 0;
+    return Number.isSafeInteger(pid) && pid > 0 ? pid : undefined;
   } catch {
-    return 0;
+    return undefined;
   }
+}
+
+// Timeout proof starts only after the fixture has published valid PIDs; otherwise Windows
+// cleanup can race the open-truncate/zero-PID state and test the wrong process.
+function createReadyGatedKnipTimeoutPreload(): string {
+  return `
+import { existsSync } from "node:fs";
+const realSetTimeout = globalThis.setTimeout.bind(globalThis);
+const realClearTimeout = globalThis.clearTimeout.bind(globalThis);
+const realSetInterval = globalThis.setInterval.bind(globalThis);
+const realClearInterval = globalThis.clearInterval.bind(globalThis);
+const readinessIntervals = new WeakSet();
+globalThis.clearTimeout = (timer) => {
+  if (timer && typeof timer === "object" && readinessIntervals.delete(timer)) {
+    return realClearInterval(timer);
+  }
+  return realClearTimeout(timer);
+};
+globalThis.setTimeout = (callback, delay, ...args) => {
+  if (delay !== 600_000) {
+    return realSetTimeout(callback, delay, ...args);
+  }
+  const readyPath = process.env.OPENCLAW_TEST_KNIP_READY;
+  const interval = realSetInterval(() => {
+    if (!readyPath || !existsSync(readyPath)) {
+      return;
+    }
+    readinessIntervals.delete(interval);
+    realClearInterval(interval);
+    callback(...args);
+  }, 5);
+  readinessIntervals.add(interval);
+  return interval;
+};
+`;
 }
 
 function runKnipCliFixture({
@@ -557,34 +592,42 @@ Delete the files or model their real entrypoints in Knip.`,
       const root = mkdtempSync(path.join(os.tmpdir(), "openclaw-knip-windows-timeout-"));
       const childPidPath = path.join(root, "child.pid");
       const descendantPidPath = path.join(root, "descendant.pid");
-      let childPid = 0;
-      let descendantPid = 0;
+      const readyMarkerPath = path.join(root, "ready");
+      let childPid: number | undefined;
+      let descendantPid: number | undefined;
 
       try {
+        writeFileSync(childPidPath, "0");
+        writeFileSync(descendantPidPath, "0");
+        expect(readRecordedPidForCleanup(childPidPath)).toBeUndefined();
+        expect(readRecordedPidForCleanup(descendantPidPath)).toBeUndefined();
+
         const result = runKnipCliFixture({
           childSource: `
 const { spawn } = require("node:child_process");
 const fs = require("node:fs");
-const descendant = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
-  stdio: "ignore",
-});
-fs.writeFileSync(process.env.OPENCLAW_TEST_CHILD_PID, String(process.pid));
-fs.writeFileSync(process.env.OPENCLAW_TEST_DESCENDANT_PID, String(descendant.pid));
+setTimeout(() => {
+  const descendant = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+    stdio: "ignore",
+  });
+  fs.writeFileSync(process.env.OPENCLAW_TEST_CHILD_PID, String(process.pid));
+  fs.writeFileSync(process.env.OPENCLAW_TEST_DESCENDANT_PID, String(descendant.pid));
+  fs.writeFileSync(process.env.OPENCLAW_TEST_KNIP_READY, "ready");
+}, 50);
 setInterval(() => {}, 1000);
 `,
           extraEnv: {
             OPENCLAW_TEST_CHILD_PID: childPidPath,
             OPENCLAW_TEST_DESCENDANT_PID: descendantPidPath,
+            OPENCLAW_TEST_KNIP_READY: readyMarkerPath,
           },
-          preloadSource: `
-const realSetTimeout = globalThis.setTimeout;
-globalThis.setTimeout = (callback, delay, ...args) =>
-  realSetTimeout(callback, delay === 600_000 ? 250 : delay, ...args);
-`,
+          preloadSource: createReadyGatedKnipTimeoutPreload(),
         });
 
-        childPid = readRecordedPid(childPidPath);
-        descendantPid = readRecordedPid(descendantPidPath);
+        childPid = await waitForPidFile(childPidPath, 2_000);
+        descendantPid = await waitForPidFile(descendantPidPath, 2_000);
+        expect(childPid).toBeGreaterThan(0);
+        expect(descendantPid).toBeGreaterThan(0);
         expect(result.status).toBe(1);
         expect(result.stderr).toContain("[deadcode] Knip command timed out");
         expect(
@@ -596,8 +639,8 @@ globalThis.setTimeout = (callback, delay, ...args) =>
         await waitForDead(childPid, 2_000);
         await waitForDead(descendantPid, 2_000);
       } finally {
-        childPid ||= readRecordedPid(childPidPath);
-        descendantPid ||= readRecordedPid(descendantPidPath);
+        childPid ??= readRecordedPidForCleanup(childPidPath);
+        descendantPid ??= readRecordedPidForCleanup(descendantPidPath);
         if (childPid && isProcessAlive(childPid)) {
           process.kill(childPid, "SIGKILL");
         }
@@ -724,27 +767,49 @@ globalThis.setTimeout = (callback, delay, ...args) =>
 
   it.skipIf(process.platform === "win32")(
     "fails the CLI when a timed-out Knip child exits with status 0",
-    () => {
-      const result = runKnipCliFixture({
-        childSource: `
+    async () => {
+      const root = mkdtempSync(path.join(os.tmpdir(), "openclaw-knip-cli-timeout-"));
+      const childPidPath = path.join(root, "child.pid");
+      const readyMarkerPath = path.join(root, "ready");
+      let childPid: number | undefined;
+      try {
+        writeFileSync(childPidPath, "0");
+        expect(readRecordedPidForCleanup(childPidPath)).toBeUndefined();
+
+        const result = runKnipCliFixture({
+          childSource: `
 const fs = require("node:fs");
 process.once("SIGTERM", () => {
   fs.writeFileSync(process.env.OPENCLAW_TEST_EXIT_MARKER, "0");
   process.exit(0);
 });
+setTimeout(() => {
+  fs.writeFileSync(process.env.OPENCLAW_TEST_CHILD_PID, String(process.pid));
+  fs.writeFileSync(process.env.OPENCLAW_TEST_KNIP_READY, "ready");
+}, 50);
 setInterval(() => {}, 1000);
 `,
-        preloadSource: `
-const realSetTimeout = globalThis.setTimeout;
-globalThis.setTimeout = (callback, delay, ...args) =>
-  realSetTimeout(callback, delay === 600_000 ? 250 : delay, ...args);
-`,
-      });
+          extraEnv: {
+            OPENCLAW_TEST_CHILD_PID: childPidPath,
+            OPENCLAW_TEST_KNIP_READY: readyMarkerPath,
+          },
+          preloadSource: createReadyGatedKnipTimeoutPreload(),
+        });
 
-      expect(result.exitMarker).toBe("0");
-      expect(result.status).toBe(1);
-      expect(result.stderr).toContain("[deadcode] Knip command timed out");
-      expect(result.stderr.trim().split("\n").at(-1)).toBe("[deadcode] FAILED (exit 1)");
+        childPid = await waitForPidFile(childPidPath, 2_000);
+        expect(childPid).toBeGreaterThan(0);
+        expect(result.exitMarker).toBe("0");
+        expect(result.status).toBe(1);
+        expect(result.stderr).toContain("[deadcode] Knip command timed out");
+        expect(result.stderr.trim().split("\n").at(-1)).toBe("[deadcode] FAILED (exit 1)");
+        await waitForDead(childPid, 2_000);
+      } finally {
+        childPid ??= readRecordedPidForCleanup(childPidPath);
+        if (childPid && isProcessAlive(childPid)) {
+          process.kill(childPid, "SIGKILL");
+        }
+        rmSync(root, { recursive: true, force: true });
+      }
     },
   );
 
