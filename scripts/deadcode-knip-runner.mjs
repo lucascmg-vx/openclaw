@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { runWithFailedTrailer } from "./lib/failed-trailer.mjs";
 import { createPnpmRunnerSpawnSpec } from "./pnpm-runner.mjs";
 
 const KNIP_VERSION = "6.8.0";
@@ -281,16 +282,13 @@ async function main() {
   if (result.output) {
     process.stdout.write(result.output);
   }
-  const exitCode = result.status ?? 1;
+  const exitCode = result.errorCode === undefined ? (result.status ?? 1) : 1;
   if (result.errorMessage) {
     process.stderr.write(`[deadcode] ${result.errorMessage}\n`);
-  }
-  if (exitCode !== 0) {
-    process.stderr.write(`[deadcode] FAILED (exit ${exitCode})\n`);
   }
   process.exitCode = exitCode;
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  await main();
+  await runWithFailedTrailer("deadcode", main);
 }

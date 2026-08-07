@@ -1,5 +1,5 @@
 // Check Deadcode Unused Files tests cover check deadcode unused files script behavior.
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
@@ -34,6 +34,52 @@ function finishFakeProcess(
 ): void {
   child.emit("exit", status, signal);
   child.emit("close", status, signal);
+}
+
+function runKnipCliFixture({
+  childSource,
+  preloadSource,
+}: {
+  childSource: string;
+  preloadSource?: string;
+}): { exitMarker: string; status: number | null; stderr: string } {
+  const root = mkdtempSync(path.join(os.tmpdir(), "openclaw-knip-cli-"));
+  const exitMarkerPath = path.join(root, "exit-marker");
+  const pnpmExecPath = path.join(root, "pnpm.cjs");
+  const preloadPath = path.join(root, "preload.mjs");
+
+  try {
+    writeFileSync(pnpmExecPath, childSource, "utf8");
+    const nodeArgs = [];
+    if (preloadSource) {
+      writeFileSync(preloadPath, preloadSource, "utf8");
+      nodeArgs.push("--import", pathToFileURL(preloadPath).href);
+    }
+    nodeArgs.push(path.resolve("scripts/deadcode-knip-runner.mjs"));
+
+    const result = spawnSync(process.execPath, nodeArgs, {
+      cwd: process.cwd(),
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        npm_execpath: pnpmExecPath,
+        OPENCLAW_TEST_EXIT_MARKER: exitMarkerPath,
+      },
+      stdio: ["ignore", "ignore", "pipe"],
+      timeout: 5_000,
+    });
+
+    if (result.error) {
+      throw result.error;
+    }
+    return {
+      exitMarker: existsSync(exitMarkerPath) ? readFileSync(exitMarkerPath, "utf8") : "",
+      status: result.status,
+      stderr: result.stderr,
+    };
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 }
 
 describe("check-deadcode-unused-files", () => {
@@ -490,6 +536,55 @@ Delete the files or model their real entrypoints in Knip.`,
       process.kill = originalKill;
     }
   });
+
+  it.skipIf(process.platform === "win32")(
+    "fails the CLI when a timed-out Knip child exits with status 0",
+    () => {
+      const result = runKnipCliFixture({
+        childSource: `
+const fs = require("node:fs");
+process.once("SIGTERM", () => {
+  fs.writeFileSync(process.env.OPENCLAW_TEST_EXIT_MARKER, "0");
+  process.exit(0);
+});
+setInterval(() => {}, 1000);
+`,
+        preloadSource: `
+const realSetTimeout = globalThis.setTimeout;
+globalThis.setTimeout = (callback, delay, ...args) =>
+  realSetTimeout(callback, delay === 600_000 ? 250 : delay, ...args);
+`,
+      });
+
+      expect(result.exitMarker).toBe("0");
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("[deadcode] Knip command timed out");
+      expect(result.stderr.trim().split("\n").at(-1)).toBe("[deadcode] FAILED (exit 1)");
+    },
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "fails the CLI when an output-capped Knip child exits with status 0",
+    () => {
+      const result = runKnipCliFixture({
+        childSource: `
+const fs = require("node:fs");
+process.stdout.on("error", () => {});
+process.once("SIGTERM", () => {
+  fs.writeFileSync(process.env.OPENCLAW_TEST_EXIT_MARKER, "0");
+  process.exit(0);
+});
+process.stdout.write(Buffer.alloc(${KNIP_MAX_BUFFER_BYTES + 1}, "x"));
+setInterval(() => {}, 1000);
+`,
+      });
+
+      expect(result.exitMarker).toBe("0");
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("[deadcode] Knip command exceeded 16777216 output bytes");
+      expect(result.stderr.trim().split("\n").at(-1)).toBe("[deadcode] FAILED (exit 1)");
+    },
+  );
 
   it("reports spawn errors", async () => {
     const resultPromise = runKnipUnusedFiles({
